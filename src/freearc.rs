@@ -82,7 +82,11 @@ const FITGIRL: [u32; 256] = {
         let mut c = n as u32;
         let mut k = 0;
         while k < 8 {
-            c = if c & 1 != 0 { (c >> 1) ^ 0x0895_171B } else { c >> 1 };
+            c = if c & 1 != 0 {
+                (c >> 1) ^ 0x0895_171B
+            } else {
+                c >> 1
+            };
             k += 1;
         }
         t[n] = c;
@@ -257,10 +261,7 @@ fn read_at(f: &mut File, at: u64, len: u64) -> Result<Vec<u8>> {
 fn control(f: &mut File, at: u64, d: &Descriptor, kind: Crc) -> Result<Vec<u8>> {
     let packed = read_at(f, at, d.packed)?;
     let out = decode_control(&packed, &d.method, d.unpacked)?;
-    ensure!(
-        kind.hash(&out) == d.crc,
-        "control block checksum mismatch"
-    );
+    ensure!(kind.hash(&out) == d.crc, "control block checksum mismatch");
     Ok(out)
 }
 

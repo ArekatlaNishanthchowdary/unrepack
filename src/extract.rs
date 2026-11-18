@@ -37,8 +37,8 @@ pub enum Stage {
 
 /// FreeArc methods compiled into unarc.dll that unrepack doesn't port yet.
 const BUILT_IN: &[&str] = &[
-    "exe", "exe2", "lzma", "lzma2", "ppmd", "tornado", "lzp",
-    "grzip", "rep", "dict", "mm", "tta", "lz4", "bcj", "bcj2",
+    "exe", "exe2", "lzma", "lzma2", "ppmd", "tornado", "lzp", "grzip", "rep", "dict", "mm", "tta",
+    "lz4", "bcj", "bcj2",
 ];
 
 /// What runs one stage.
@@ -84,9 +84,12 @@ struct External {
     files: Option<(String, String)>,
 }
 
+/// An arc.ini section: its method names and its `key=value` lines.
+type IniSection = (Vec<String>, Vec<(String, String)>);
+
 /// The `[External compressor:a,b]` sections of an arc.ini, keys lowercased.
-fn arc_ini(text: &str) -> Vec<(Vec<String>, Vec<(String, String)>)> {
-    let mut out: Vec<(Vec<String>, Vec<(String, String)>)> = Vec::new();
+fn arc_ini(text: &str) -> Vec<IniSection> {
+    let mut out: Vec<IniSection> = Vec::new();
     let mut in_ext = false;
     for line in text.lines().map(str::trim) {
         if let Some(h) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
@@ -95,7 +98,10 @@ fn arc_ini(text: &str) -> Vec<(Vec<String>, Vec<(String, String)>)> {
                 && kind.trim().eq_ignore_ascii_case("External compressor")
             {
                 in_ext = true;
-                out.push((names.split(',').map(|n| n.trim().to_string()).collect(), Vec::new()));
+                out.push((
+                    names.split(',').map(|n| n.trim().to_string()).collect(),
+                    Vec::new(),
+                ));
             }
         } else if in_ext && let Some((k, v)) = line.split_once('=') {
             out.last_mut()
@@ -111,13 +117,15 @@ impl External {
     /// Builds the decoder for `name` from an arc.ini section, with programs
     /// taken only from `dir`.
     fn from_ini(text: &str, dir: &Path, name: &str, params: &str) -> Result<Option<External>> {
-        let Some((_, keys)) = arc_ini(text).into_iter().find(|(n, _)| n.iter().any(|n| n == name))
+        let Some((_, keys)) = arc_ini(text)
+            .into_iter()
+            .find(|(n, _)| n.iter().any(|n| n == name))
         else {
             return Ok(None);
         };
         let get = |k: &str| keys.iter().find(|(x, _)| x == k).map(|(_, v)| v.as_str());
-        let cmd = get("unpackcmd")
-            .with_context(|| format!("arc.ini has no unpackcmd for '{name}'"))?;
+        let cmd =
+            get("unpackcmd").with_context(|| format!("arc.ini has no unpackcmd for '{name}'"))?;
         // header=1, FreeArc's default, adds a header unrepack doesn't parse.
         ensure!(
             get("header") == Some("0"),
@@ -141,7 +149,10 @@ impl External {
             stdio == cmd.contains("<stdout>"),
             "arc.ini method '{name}' streams only one way; not supported"
         );
-        ensure!(!toks.is_empty(), "arc.ini method '{name}' has an empty unpackcmd");
+        ensure!(
+            !toks.is_empty(),
+            "arc.ini method '{name}' has an empty unpackcmd"
+        );
         let prog = toks.remove(0);
         ensure!(
             !prog.contains(['/', '\\', ':']),
@@ -150,7 +161,12 @@ impl External {
         let exe = [dir.join(&prog), dir.join(format!("{prog}.exe"))]
             .into_iter()
             .find(|p| p.is_file())
-            .with_context(|| format!("arc.ini method '{name}' needs {prog}, missing from {}", dir.display()))?;
+            .with_context(|| {
+                format!(
+                    "arc.ini method '{name}' needs {prog}, missing from {}",
+                    dir.display()
+                )
+            })?;
         let files = (!stdio).then(|| {
             (
                 sub(get("packedfile").unwrap_or("$$arcpackedfile$$.tmp")),
@@ -159,7 +175,9 @@ impl External {
         });
         if let Some((p, d)) = &files {
             ensure!(
-                [p, d].iter().all(|f| !f.contains(['/', '\\', ':']) && !f.is_empty() && p != d),
+                [p, d]
+                    .iter()
+                    .all(|f| !f.contains(['/', '\\', ':']) && !f.is_empty() && p != d),
                 "arc.ini method '{name}' uses odd file names"
             );
         }
@@ -173,7 +191,12 @@ impl External {
 
     /// Decodes everything `input` gives into `out`, in folder `dir` (which
     /// must hold nothing else this tool cares about).
-    fn run_once(&self, input: &mut (dyn Read + Send), dir: &Path, out: &mut dyn Write) -> io::Result<u64> {
+    fn run_once(
+        &self,
+        input: &mut (dyn Read + Send),
+        dir: &Path,
+        out: &mut dyn Write,
+    ) -> io::Result<u64> {
         let fail = |what: String| io::Error::other(format!("decoder '{}' {what}", self.name));
         let Some((packed, data)) = &self.files else {
             let mut child = Command::new(&self.exe)
@@ -218,7 +241,10 @@ impl External {
         win::adopt(&child);
         let o = child.wait_with_output()?;
         let said = String::from_utf8_lossy(&[o.stdout, o.stderr].concat()).into_owned();
-        let said: Vec<&str> = said.split(['\r', '\n']).filter(|l| !l.trim().is_empty()).collect();
+        let said: Vec<&str> = said
+            .split(['\r', '\n'])
+            .filter(|l| !l.trim().is_empty())
+            .collect();
         if !o.status.success() {
             for l in &said {
                 crate::log::line(l, true);
@@ -229,14 +255,22 @@ impl External {
             crate::log::to_file(l);
         }
         let _ = fs::remove_file(&p);
-        let n = io::copy(&mut File::open(&d).map_err(|e| fail(format!("wrote no {data}: {e}")))?, out)?;
+        let n = io::copy(
+            &mut File::open(&d).map_err(|e| fail(format!("wrote no {data}: {e}")))?,
+            out,
+        )?;
         fs::remove_file(&d)?;
         Ok(n)
     }
 
     /// `4x4` around this method. ponytail: one frame at a time; FreeArc
     /// decodes frames on several threads, add that if this is the slow stage.
-    fn four_by_four(&self, input: &mut (dyn Read + Send), dir: &Path, out: &mut dyn Write) -> io::Result<u64> {
+    fn four_by_four(
+        &self,
+        input: &mut (dyn Read + Send),
+        dir: &Path,
+        out: &mut dyn Write,
+    ) -> io::Result<u64> {
         let bad = |m: String| io::Error::new(io::ErrorKind::InvalidData, format!("4x4: {m}"));
         let mut h = [0u8; 4];
         input.read_exact(&mut h)?;
@@ -261,7 +295,9 @@ impl External {
                 return Err(bad("stream ends inside a frame".into()));
             }
             if n != size {
-                return Err(bad(format!("frame decoded to {n} bytes, its header says {size}")));
+                return Err(bad(format!(
+                    "frame decoded to {n} bytes, its header says {size}"
+                )));
             }
             total += n;
         }
@@ -356,7 +392,10 @@ impl Decoders {
             let mut parts = params.split(':');
             let inner = parts
                 .by_ref()
-                .find(|p| !(p.starts_with(['t', 'i', 'r', 'b']) && p[1..].starts_with(|c: char| c.is_ascii_digit())))
+                .find(|p| {
+                    !(p.starts_with(['t', 'i', 'r', 'b'])
+                        && p[1..].starts_with(|c: char| c.is_ascii_digit()))
+                })
                 .context("4x4 without an inner method")?;
             let rest: Vec<&str> = parts.collect();
             let e = External::from_ini(&ini, dir, inner, &rest.join(":"))?.with_context(|| {
@@ -382,9 +421,15 @@ impl Decoders {
             "dispack" | "dispack070" => {
                 let mut block = 8 << 20;
                 for p in params.split(':').filter(|p| !p.is_empty() && *p != "x") {
-                    block = mem_param(p.strip_prefix('b').filter(|r| !r.is_empty() && r.starts_with(|c: char| c.is_ascii_digit())).unwrap_or(p))
-                        .filter(|&b| b > 0 && b <= 1 << 30)
-                        .with_context(|| format!("method '{name}': parameter '{p}' not understood"))?;
+                    block = mem_param(
+                        p.strip_prefix('b')
+                            .filter(|r| {
+                                !r.is_empty() && r.starts_with(|c: char| c.is_ascii_digit())
+                            })
+                            .unwrap_or(p),
+                    )
+                    .filter(|&b| b > 0 && b <= 1 << 30)
+                    .with_context(|| format!("method '{name}': parameter '{p}' not understood"))?;
                 }
                 return Ok(Decode::Dispack(block));
             }
@@ -643,6 +688,10 @@ impl Progress {
             return;
         }
         self.last = Instant::now();
+        // unrepack-gui sets this and reads `@progress <phase> <done> <total>`.
+        if std::env::var_os("UNREPACK_GUI").is_some() {
+            eprintln!("@progress {what} {} {}", self.done, self.total);
+        }
         let secs = self.start.elapsed().as_secs_f64().max(0.001);
         let speed = self.done as f64 / secs;
         let left = self.total.saturating_sub(self.done) as f64 / speed.max(1.0);
@@ -987,15 +1036,26 @@ mod tests {
                    [External compressor:xt2p,xt2png,xt2]\nheader    = 0\nunpackcmd = xtool.exe decode -t100p - - <stdin> <stdout>\n\n\
                    [External compressor:bcm]\nunpackcmd = bcm -d $$arcpackedfile$$.tmp $$arcdatafile$$.tmp\n";
         fs::write(dir.path().join("arc.ini"), ini).unwrap();
-        let e = External::from_ini(ini, dir.path(), "rzwb", "").unwrap().unwrap();
+        let e = External::from_ini(ini, dir.path(), "rzwb", "")
+            .unwrap()
+            .unwrap();
         assert_eq!(e.exe, dir.path().join("rzw.exe"));
         assert_eq!(e.args, ["d", "f2", "f1", "1023", "1023"]);
         assert_eq!(e.files, Some(("f2".into(), "f1".into())));
-        let e = External::from_ini(ini, dir.path(), "xt2png", "").unwrap().unwrap();
+        let e = External::from_ini(ini, dir.path(), "xt2png", "")
+            .unwrap()
+            .unwrap();
         assert_eq!(e.args, ["decode", "-t100p", "-", "-"]);
         assert_eq!(e.files, None);
-        assert!(External::from_ini(ini, dir.path(), "bcm", "").is_err(), "header=1");
-        assert!(External::from_ini(ini, dir.path(), "lolz", "").unwrap().is_none());
+        assert!(
+            External::from_ini(ini, dir.path(), "bcm", "").is_err(),
+            "header=1"
+        );
+        assert!(
+            External::from_ini(ini, dir.path(), "lolz", "")
+                .unwrap()
+                .is_none()
+        );
 
         let dec = Decoders {
             dir: Some(dir.path().into()),
@@ -1003,10 +1063,19 @@ mod tests {
             work: dir.path().into(),
         };
         assert!(matches!(dec.resolve("magic2", ""), Ok(Decode::Cls(_))));
-        assert!(matches!(dec.resolve("4x4", "b128mb:rzwb"), Ok(Decode::FourByFour(_))));
+        assert!(matches!(
+            dec.resolve("4x4", "b128mb:rzwb"),
+            Ok(Decode::FourByFour(_))
+        ));
         assert!(matches!(dec.resolve("delta", ""), Ok(Decode::Delta)));
-        assert!(matches!(dec.resolve("dispack070", ""), Ok(Decode::Dispack(0x80_0000))));
-        assert!(matches!(dec.resolve("dispack", "b4mb:x"), Ok(Decode::Dispack(0x40_0000))));
+        assert!(matches!(
+            dec.resolve("dispack070", ""),
+            Ok(Decode::Dispack(0x80_0000))
+        ));
+        assert!(matches!(
+            dec.resolve("dispack", "b4mb:x"),
+            Ok(Decode::Dispack(0x40_0000))
+        ));
         assert!(dec.resolve("dispack070", "7").is_err(), "bare number");
         let err = dec.resolve("exe2", "").unwrap_err().to_string();
         assert!(err.contains("built into FreeArc"), "{err}");
@@ -1032,13 +1101,21 @@ mod tests {
         s.extend(frame(b"hello ", 6));
         s.extend(frame(b"world", 5));
         let mut out = Vec::new();
-        let n = copy.four_by_four(&mut &s[..], dir.path(), &mut out).unwrap();
+        let n = copy
+            .four_by_four(&mut &s[..], dir.path(), &mut out)
+            .unwrap();
         assert_eq!((n, &out[..]), (11, &b"hello world"[..]));
 
         let mut bad = vec![0u8; 4];
         bad.extend(frame(b"hello", 9));
-        assert!(copy.four_by_four(&mut &bad[..], dir.path(), &mut Vec::new()).is_err());
+        assert!(
+            copy.four_by_four(&mut &bad[..], dir.path(), &mut Vec::new())
+                .is_err()
+        );
         let cut = &s[..s.len() - 2];
-        assert!(copy.four_by_four(&mut &cut[..], dir.path(), &mut Vec::new()).is_err());
+        assert!(
+            copy.four_by_four(&mut &cut[..], dir.path(), &mut Vec::new())
+                .is_err()
+        );
     }
 }

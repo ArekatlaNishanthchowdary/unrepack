@@ -21,11 +21,17 @@
   <img src="https://img.shields.io/badge/version-0.1-orange.svg" alt="Version 0.1" />
 </p>
 
-unrepack is a free, open-source command line tool for Windows. It extracts the data files of game repacks built on FreeArc, such as DODI and FitGirl repacks, straight into a game folder. It checks every file's CRC as it goes. It does not run the installer, so there is no installer UI, registry editing or redistributable setup.
+unrepack is a free, open-source app and command line tool for Windows. It extracts the data files of game repacks built on FreeArc, such as DODI and FitGirl repacks, straight into a game folder. It checks every file's CRC as it goes. It does not run the installer, so there is no installer UI, registry editing or redistributable setup.
 
 A repack's installer needs room for the repack **and** the whole game at once. Crusader Kings III [DODI Repack] is 6.05 GB packed and 19.87 GB installed, so it needs about 26 GB of disk. With `--free-as-read`, unrepack needs 13.94 GB. It gives each data file's bytes back to the disk as soon as they are decoded, so the space the repack frees holds the game files that follow.
 
 ## Usage
+
+### The app
+
+Run `unrepack-gui.exe` as administrator; the repacks' decoders don't work without it. Pick the repack folder, where to install, and the decoders folder (the folder is filled in for you when it holds the decoders). Then choose what happens to the repack and press **Check space** or **Unpack**. The app runs `unrepack.exe` next to it and shows its progress and log, so it does exactly what the command line does, with the same checks. It asks before any mode that deletes or frees the repack, and before stopping a run that would lose it.
+
+Keep `unrepack-gui.exe`, `unrepack.exe` and `unrepack-clshost.exe` in the same folder.
 
 ### See whether it fits
 
@@ -133,7 +139,7 @@ gcc -m32 -O2 -s -static -o target/release/unrepack-clshost.exe clshost/clshost.c
 cargo test --release
 ```
 
-The 20 tests write FreeArc archives in the layout measured from real repacks and run the binary on them. They use `storing`, `copy`, and a CLS codec built from `clshost/test_copy.c`, so the host process runs as it does with a repack's decoders. `delta` and `dispack070` are tested on hand-built streams. `UNREPACK_SAMPLE=<data file> cargo test real_sample` also parses a real data file, and `UNREPACK_DUMP=<dir>` saves every stage's output for debugging.
+`cargo build --release` builds both `unrepack.exe` and the app, `unrepack-gui.exe` (egui, a single native exe). The 20 tests write FreeArc archives in the layout measured from real repacks and run the binary on them. They use `storing`, `copy`, and a CLS codec built from `clshost/test_copy.c`, so the host process runs as it does with a repack's decoders. `delta` and `dispack070` are tested on hand-built streams. `UNREPACK_SAMPLE=<data file> cargo test real_sample` also parses a real data file, and `UNREPACK_DUMP=<dir>` saves every stage's output for debugging.
 
 ## License
 
