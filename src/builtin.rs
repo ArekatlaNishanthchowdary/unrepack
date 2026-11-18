@@ -8,6 +8,8 @@
 //! match FitGirl's unarc.dll byte for byte.
 //!
 //! Where the C code trusts sizes from the stream, these refuse them instead.
+//!
+//! Licence: not MIT OR Apache-2.0 like the rest of unrepack; see LICENSE-FREEARC.
 
 use std::io::{self, Read, Write};
 

@@ -1,6 +1,6 @@
 //! unrepack: extract game repacks built on FreeArc (DODI, FitGirl and the
 //! like) without the installer, optionally giving the repack's space back
-//! while it is read. Inspired by HatchZip's in-place extraction.
+//! while it is read.
 
 #[macro_use]
 mod log;

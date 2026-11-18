@@ -1,0 +1,29 @@
+Licence notice for src/builtin.rs
+=================================
+
+src/builtin.rs is NOT covered by unrepack's MIT OR Apache-2.0 licence. It is
+a Rust port of two decoders from the FreeArc 0.67 source
+(https://github.com/mrkaban/FreeArc-0.67, which mirrors Bulat Ziganshin's
+FreeArc), and it stays under the terms of that source.
+
+1. delta (delta_decompress), from Compression/Delta/Delta.cpp,
+   (c) Bulat Ziganshin. Its header reads, verbatim:
+
+     All rights reserved. You can for free use decompression part of the
+     algorithm for decompression of FreeArc archives.
+     For any other usage ask me for the license.
+
+   So this part may be used, free of charge, only to decompress FreeArc
+   archives, which is all unrepack does with it. It is not open source.
+   Any other use needs a licence from its author.
+
+2. dispack070 (DISPACK_METHOD::decompress and DisUnFilter), from
+   Compression/DisPack/C_DisPack.cpp and DisPack.cpp, Fabian Giesen's x86
+   filter as included in FreeArc. These files carry no licence line of their
+   own. The FreeArc tree they come from is distributed under the GNU General
+   Public License, version 2 (https://www.gnu.org/licenses/old-licenses/gpl-2.0.html).
+
+The opcode tables in src/builtin.rs were generated from that source.
+
+Building unrepack without src/builtin.rs leaves only MIT OR Apache-2.0 code.
+The repack's FitGirl bins that use delta or dispack070 then can't be decoded.

@@ -2,6 +2,8 @@
 name = "unrepack"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0" # except src/builtin.rs: see LICENSE-FREEARC
+repository = "https://github.com/ArekatlaNishanthchowdary/unrepack"
 
 [dependencies]
 anyhow = "1.0.104"
