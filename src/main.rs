@@ -1,0 +1,466 @@
+//! unrepack: extract game repacks built on FreeArc (DODI, FitGirl and the
+//! like) without the installer, optionally giving the repack's space back
+//! while it is read. Inspired by HatchZip's in-place extraction.
+
+#[macro_use]
+mod log;
+mod builtin;
+mod extract;
+mod freearc;
+mod win;
+
+use std::fs;
+use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+use anyhow::{Context, Result, bail, ensure};
+
+use extract::{Decoders, Job, Progress, human};
+
+const USAGE: &str = "\
+unrepack 0.1: extract FreeArc repack data files without running the installer
+
+Usage:
+  unrepack list <data file>
+  unrepack extract <repack folder | data files...> -o <output folder> [options]
+
+Options:
+  --decoders <dir>  folder with the repack's cls-*.dll, cls-*_x64.exe and cls.ini
+  --host <exe>      the 32-bit CLS host (default: unrepack-clshost.exe next to unrepack)
+  --work <dir>      where decoders run and keep temp files (default: <output>\\.unrepack-work)
+  --log <file>      also write every message and a progress line every 5 s to <file>
+  --check           plan only: say whether it fits, change nothing
+  --delete-each     delete each data file once all of it is extracted (crash safe)
+  --free-as-read    free each data file's bytes as they are decoded. NOT crash safe in
+                    v0.1: if the run stops after the first freed byte, the repack is lost
+  --no-verify       skip the decode-only pass that checks every CRC before anything is
+                    freed or deleted (halves the time, removes the safety net)
+  --yes             don't ask before freeing or deleting
+
+The repack's decoders are programs that came with the download; unrepack runs them.
+";
+
+struct Args {
+    cmd: String,
+    inputs: Vec<PathBuf>,
+    out: Option<PathBuf>,
+    decoders: Option<PathBuf>,
+    host: Option<PathBuf>,
+    work: Option<PathBuf>,
+    log: Option<PathBuf>,
+    check: bool,
+    delete_each: bool,
+    free_as_read: bool,
+    verify: bool,
+    yes: bool,
+}
+
+fn parse() -> Result<Args> {
+    let mut it = std::env::args_os().skip(1);
+    let cmd = it
+        .next()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut a = Args {
+        cmd,
+        inputs: vec![],
+        out: None,
+        decoders: None,
+        host: None,
+        work: None,
+        log: None,
+        check: false,
+        delete_each: false,
+        free_as_read: false,
+        verify: true,
+        yes: false,
+    };
+    while let Some(arg) = it.next() {
+        let mut value = |name: &str| {
+            it.next()
+                .map(PathBuf::from)
+                .with_context(|| format!("{name} needs a value"))
+        };
+        match arg.to_string_lossy().as_ref() {
+            "-o" | "--output" => a.out = Some(value("-o")?),
+            "--decoders" => a.decoders = Some(value("--decoders")?),
+            "--host" => a.host = Some(value("--host")?),
+            "--work" => a.work = Some(value("--work")?),
+            "--log" => a.log = Some(value("--log")?),
+            "--check" => a.check = true,
+            "--delete-each" => a.delete_each = true,
+            "--free-as-read" => a.free_as_read = true,
+            "--no-verify" => a.verify = false,
+            "--yes" | "-y" => a.yes = true,
+            s if s.starts_with('-') => bail!("unknown option {s}\n\n{USAGE}"),
+            _ => a.inputs.push(PathBuf::from(arg)),
+        }
+    }
+    Ok(a)
+}
+
+/// Data files named directly, or every FreeArc file in a folder, by name.
+fn data_files(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    for p in inputs {
+        if p.is_dir() {
+            let mut found: Vec<PathBuf> = fs::read_dir(p)
+                .with_context(|| format!("listing {}", p.display()))?
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.is_file() && freearc::sniff(p))
+                .collect();
+            found.sort();
+            ensure!(
+                !found.is_empty(),
+                "no FreeArc data files in {}",
+                p.display()
+            );
+            out.extend(found);
+        } else {
+            ensure!(
+                freearc::sniff(p),
+                "{} is not a FreeArc archive",
+                p.display()
+            );
+            out.push(p.clone());
+        }
+    }
+    ensure!(
+        !out.is_empty(),
+        "name a repack folder or its data files\n\n{USAGE}"
+    );
+    Ok(out
+        .into_iter()
+        .map(|p| std::path::absolute(&p).unwrap_or(p))
+        .collect())
+}
+
+fn list(path: &Path) -> Result<()> {
+    let a = freearc::open(path)?;
+    say!(
+        "{}: {} entries, {} packed, {} unpacked",
+        path.display(),
+        a.entries(),
+        human(a.len),
+        human(a.unpacked())
+    );
+    for b in &a.blocks {
+        say!(
+            "  block '{}' at {}: {} packed, {} unpacked, {} entries",
+            b.method,
+            b.start,
+            human(b.packed),
+            human(b.unpacked()),
+            b.entries.len()
+        );
+    }
+    Ok(())
+}
+
+/// What the disk must have free, from a replay of the run: each data file
+/// adds its output, rounded up to 4 KiB per file; with --free-as-read it gives
+/// back its packed bytes as it goes, with --delete-each once it is done.
+/// ponytail: --free-as-read assumes output and freed input keep pace; a
+/// decoder that runs far ahead needs more, and the run pauses on a full disk.
+fn space_needed(jobs: &[(PathBuf, freearc::Archive)], consume: bool, delete_each: bool) -> u64 {
+    let mut written = 0u64;
+    let mut freed = 0u64;
+    let mut peak = 0u64;
+    for (_, a) in jobs {
+        let out: u64 = a
+            .blocks
+            .iter()
+            .flat_map(|b| &b.entries)
+            .map(|e| e.size.next_multiple_of(4096))
+            .sum();
+        if consume {
+            peak = peak.max((written + out).saturating_sub(freed + a.len));
+        } else {
+            peak = peak.max((written + out).saturating_sub(freed));
+        }
+        written += out;
+        if consume || delete_each {
+            freed += a.len;
+        }
+    }
+    peak
+}
+
+fn confirm(question: &str) -> Result<bool> {
+    eprint!("{question} Type yes to go on: ");
+    std::io::stderr().flush()?;
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    Ok(line.trim().eq_ignore_ascii_case("yes"))
+}
+
+fn extract_cmd(a: Args) -> Result<()> {
+    let out = a
+        .out
+        .clone()
+        .context("say where to extract with -o <folder>")?;
+    let files = data_files(&a.inputs)?;
+    let mut jobs = Vec::new();
+    for f in &files {
+        ensure!(
+            !extract::marker(f).exists(),
+            "{} was partly freed by an earlier run, which v0.1 can't continue. Its data is gone; \
+             the repack has to be downloaded again.",
+            f.display()
+        );
+        let arc =
+            freearc::open(f).with_context(|| format!("reading the index of {}", f.display()))?;
+        jobs.push((f.clone(), arc));
+    }
+
+    fs::create_dir_all(&out).with_context(|| format!("creating {}", out.display()))?;
+    let out = std::path::absolute(&out)?;
+    let host = match &a.host {
+        Some(h) => h.clone(),
+        None => std::env::current_exe()?.with_file_name("unrepack-clshost.exe"),
+    };
+    let work = a.work.clone().unwrap_or_else(|| out.join(".unrepack-work"));
+    let dec = Decoders {
+        dir: a
+            .decoders
+            .clone()
+            .map(|d| std::path::absolute(&d).unwrap_or(d)),
+        host,
+        work,
+    };
+
+    // Everything refusable is refused here, before anything changes.
+    let mut seen = std::collections::HashSet::new();
+    for (f, arc) in &jobs {
+        for b in &arc.blocks {
+            dec.check(b).with_context(|| format!("{}", f.display()))?;
+            for e in &b.entries {
+                let key = e.path.to_string_lossy().to_lowercase();
+                ensure!(
+                    seen.insert(key) || e.is_dir,
+                    "{} appears twice in the repack",
+                    e.path.display()
+                );
+                let t = out.join(&e.path);
+                ensure!(
+                    e.is_dir || !t.exists(),
+                    "{} already exists; extract into an empty folder",
+                    t.display()
+                );
+            }
+        }
+    }
+    let out_volume = win::volume(&out)?;
+    let same_volume = jobs
+        .iter()
+        .all(|(f, _)| win::volume(f).ok() == Some(out_volume));
+    let mut consume = a.free_as_read;
+    if consume {
+        let all_sparse = jobs.iter().all(|(f, _)| {
+            fs::File::open(f)
+                .map(|h| win::sparse_supported(&h))
+                .unwrap_or(false)
+        });
+        ensure!(
+            all_sparse,
+            "the repack's drive can't free parts of a file (FAT32 or exFAT?); drop --free-as-read"
+        );
+        if !same_volume {
+            note!(
+                "note: the output is on another drive, so freeing the repack doesn't help it; not freeing."
+            );
+            consume = false;
+        }
+    }
+    let delete_each = a.delete_each && same_volume;
+    let total_out: u64 = jobs.iter().map(|(_, a)| a.unpacked()).sum();
+    let total_in: u64 = jobs.iter().map(|(_, a)| a.len).sum();
+    let need = space_needed(&jobs, consume, delete_each);
+    let free = win::free_space(&out)?;
+    say!(
+        "{} data file(s), {} packed, {} to write; free {}, needed {}{}",
+        jobs.len(),
+        human(total_in),
+        human(total_out),
+        human(free),
+        human(need),
+        if consume {
+            " (freeing the repack as it is read)"
+        } else if delete_each {
+            " (deleting each data file when done)"
+        } else {
+            ""
+        }
+    );
+    if !consume {
+        let with_free = space_needed(&jobs, same_volume, false);
+        if with_free < need {
+            say!("with --free-as-read it would need {}", human(with_free));
+        }
+    }
+    say!(
+        "decoders keep temp files in {}; that space is not counted.",
+        dec.work.display()
+    );
+    let fits = free >= need;
+    if a.check {
+        say!("{}", if fits { "it fits" } else { "it does not fit" });
+        return Ok(());
+    }
+    ensure!(
+        fits,
+        "not enough free space: {} more is needed",
+        human(need - free)
+    );
+
+    if (consume || delete_each) && !a.yes {
+        let q = if consume {
+            "This frees the repack's bytes as they are read. If the run stops for any reason after \
+             it starts, the repack is lost and must be downloaded again."
+        } else {
+            "Each data file is deleted once all of it is extracted and checked."
+        };
+        if !confirm(q)? {
+            bail!("stopped; nothing was changed");
+        }
+    }
+    fs::create_dir_all(&dec.work).with_context(|| format!("creating {}", dec.work.display()))?;
+
+    if a.verify {
+        let mut p = Progress::new(total_out);
+        let temp = extract::FolderPeak::start(dec.work.clone());
+        for (f, arc) in &jobs {
+            note!("verifying {}", f.display());
+            let r = extract::verify(
+                &Job {
+                    data: f,
+                    archive: arc,
+                },
+                &dec,
+                &mut p,
+            );
+            if r.is_err() {
+                temp.finish();
+                return r;
+            }
+        }
+        let temp = temp.finish();
+        note!("every file's CRC matches");
+        // The plan above was an estimate; the verify pass measured the two
+        // things it couldn't know, so check again before anything changes.
+        let files: u64 = jobs
+            .iter()
+            .flat_map(|(_, a)| &a.blocks)
+            .flat_map(|b| &b.entries)
+            .filter(|e| !e.is_dir)
+            .count() as u64;
+        let base = if consume {
+            p.max_lead + files * 4096 + 2 * extract::PUNCH_STEP
+        } else {
+            need
+        };
+        let measured = base + temp;
+        let free_now = win::free_space(&out)?;
+        say!(
+            "measured: decoder temp files peaked at {}, output ran at most {} ahead of the input; needs {}, free {}",
+            human(temp),
+            human(p.max_lead),
+            human(measured),
+            human(free_now)
+        );
+        ensure!(
+            free_now >= measured,
+            "not enough free space by the measured plan: {} more is needed. Nothing was changed",
+            human(measured - free_now)
+        );
+        note!("extracting");
+    }
+    let mut p = Progress::new(total_out);
+    for (f, arc) in &jobs {
+        note!("extracting {}", f.display());
+        extract::run(
+            &Job {
+                data: f,
+                archive: arc,
+            },
+            &dec,
+            &out,
+            consume,
+            &mut p,
+        )?;
+        if delete_each && !consume {
+            fs::remove_file(f).with_context(|| format!("deleting {}", f.display()))?;
+        }
+    }
+    let _ = fs::remove_dir(&dec.work);
+    say!("done: {} in {}", human(total_out), out.display());
+    Ok(())
+}
+
+fn main() -> ExitCode {
+    let result = parse()
+        .and_then(|a| {
+            if let Some(l) = &a.log {
+                log::open(l)?;
+            }
+            Ok(a)
+        })
+        .and_then(|a| match a.cmd.as_str() {
+            "list" => a.inputs.iter().try_for_each(|p| list(p)),
+            "extract" => extract_cmd(a),
+            _ => {
+                print!("{USAGE}");
+                Ok(())
+            }
+        });
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            note!("error: {e:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn arc(len: u64, out: u64) -> freearc::Archive {
+        freearc::Archive {
+            len,
+            blocks: vec![freearc::Block {
+                method: "storing".into(),
+                start: 0,
+                packed: len,
+                entries: vec![freearc::Entry {
+                    path: "a".into(),
+                    size: out,
+                    crc: 0,
+                    is_dir: false,
+                }],
+                crc: freearc::Crc::Ieee,
+            }],
+        }
+    }
+
+    #[test]
+    fn space_plan_matches_the_ck3_numbers() {
+        // Crusader Kings III [DODI Repack]: data1 then data2.
+        let jobs = vec![
+            ("1".into(), arc(5_740_077_565, 19_371_573_248)),
+            ("2".into(), arc(307_063_704, 496_164_864)),
+        ];
+        // Nothing freed: all output on top of the repack.
+        assert_eq!(space_needed(&jobs, false, false), 19_867_738_112);
+        // Whole files deleted when done: the peak is data1's own output, before
+        // anything can go; little help with one big data file.
+        assert_eq!(space_needed(&jobs, false, true), 19_371_573_248);
+        // Freed as read: output minus the whole repack.
+        assert_eq!(
+            space_needed(&jobs, true, false),
+            19_867_738_112 - 6_047_141_269
+        );
+    }
+}
