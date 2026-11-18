@@ -77,6 +77,65 @@ fn has_decoders(dir: &Path) -> bool {
     })
 }
 
+const OK_GREEN: Color32 = Color32::from_rgb(60, 170, 90);
+
+/// Roomier spacing, rounder corners and slightly larger text than egui's defaults.
+fn theme(ctx: &egui::Context) {
+    use egui::{FontId, TextStyle};
+    ctx.all_styles_mut(|s| {
+        s.spacing.item_spacing = egui::vec2(8.0, 8.0);
+        s.spacing.button_padding = egui::vec2(12.0, 5.0);
+        s.spacing.interact_size.y = 26.0;
+        s.spacing.indent = 26.0;
+        for (t, size) in [
+            (TextStyle::Heading, 22.0),
+            (TextStyle::Body, 14.0),
+            (TextStyle::Button, 14.0),
+            (TextStyle::Small, 11.5),
+        ] {
+            let family = s.text_styles[&t].family.clone();
+            s.text_styles.insert(t, FontId::new(size, family));
+        }
+        let w = &mut s.visuals.widgets;
+        for v in [
+            &mut w.noninteractive,
+            &mut w.inactive,
+            &mut w.hovered,
+            &mut w.active,
+            &mut w.open,
+        ] {
+            v.corner_radius = 6.into();
+        }
+    });
+}
+
+/// A titled section on a slightly raised background.
+fn card(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::group(ui.style())
+        .fill(ui.visuals().faint_bg_color)
+        .inner_margin(12)
+        .corner_radius(8)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new(title).strong().size(15.0));
+            ui.add_space(2.0);
+            add(ui);
+        });
+}
+
+/// A tinted box for a warning or a result.
+fn banner(ui: &mut egui::Ui, color: Color32, add: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::new()
+        .fill(color.gamma_multiply(0.12))
+        .stroke((1.0, color.gamma_multiply(0.6)))
+        .inner_margin(10)
+        .corner_radius(8)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            add(ui);
+        });
+}
+
 fn is_admin() -> bool {
     unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() != 0 }
 }
@@ -370,10 +429,11 @@ impl App {
         value: &mut String,
     ) -> Option<std::path::PathBuf> {
         ui.horizontal(|ui| {
-            ui.add_sized([110.0, 20.0], egui::Label::new(label));
+            ui.add_sized([120.0, 24.0], egui::Label::new(label));
             ui.add(
                 egui::TextEdit::singleline(value)
-                    .desired_width((ui.available_width() - 80.0).max(120.0)),
+                    // Room for the Browse button and the gap before it.
+                    .desired_width((ui.available_width() - 96.0).max(120.0)),
             );
             ui.button("Browse…")
                 .clicked()
@@ -386,85 +446,122 @@ impl App {
     fn body(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let running = self.run.is_some();
-        ui.heading("unrepack");
-        ui.label("Unpack a FreeArc game repack (DODI, FitGirl and similar) without its installer.");
-        ui.add_space(6.0);
+        ui.heading(RichText::new("unrepack").strong());
+        ui.label(
+            RichText::new(
+                "Unpack a FreeArc game repack (DODI, FitGirl and similar) without its installer.",
+            )
+            .weak(),
+        );
+        ui.add_space(4.0);
 
         if !self.admin {
-            ui.horizontal(|ui| {
-                ui.colored_label(
-                    ui.visuals().warn_fg_color,
-                    "Not running as administrator. The repacks' decoders need it to unpack; Check space works without.",
-                );
-                if ui.add_enabled(!running, egui::Button::new("Restart as administrator")).clicked()
-                    && restart_as_admin()
-                {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
+            let warn = ui.visuals().warn_fg_color;
+            banner(ui, warn, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new("⚠ Not running as administrator.")
+                            .color(warn)
+                            .strong(),
+                    );
+                    ui.label("The repacks' decoders need it to unpack; Check space works without.");
+                    if ui
+                        .add_enabled(!running, egui::Button::new("Restart as administrator"))
+                        .clicked()
+                        && restart_as_admin()
+                    {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
             });
-            ui.add_space(6.0);
         }
 
         ui.add_enabled_ui(!running, |ui| {
-            if let Some(d) = Self::folder_row(ui, "Repack folder", &mut self.repack) {
-                self.picked_repack(&d);
-            }
-            if let Some(d) = Self::folder_row(ui, "Install to", &mut self.out) {
-                self.out = d.display().to_string();
-            }
-            if let Some(d) = Self::folder_row(ui, "Decoders folder", &mut self.decoders) {
-                self.decoders = d.display().to_string();
-            }
-            ui.small(
-                "Decoders are the repack's own cls-*.dll, cls.ini and arc.ini files. Most repacks keep them \
-                 inside Setup.exe; unrepack can't take them out of it yet, so they must be in a folder.",
-            );
-            ui.add_space(8.0);
+            card(ui, "Folders", |ui| {
+                if let Some(d) = Self::folder_row(ui, "Repack folder", &mut self.repack) {
+                    self.picked_repack(&d);
+                }
+                if let Some(d) = Self::folder_row(ui, "Install to", &mut self.out) {
+                    self.out = d.display().to_string();
+                }
+                if let Some(d) = Self::folder_row(ui, "Decoders folder", &mut self.decoders) {
+                    self.decoders = d.display().to_string();
+                }
+                ui.label(
+                    RichText::new(
+                        "Decoders are the repack's own cls-*.dll, cls.ini and arc.ini files. Most repacks keep them \
+                         inside Setup.exe; unrepack can't take them out of it yet, so they must be in a folder.",
+                    )
+                    .small()
+                    .weak(),
+                );
+            });
 
-            ui.label(RichText::new("While unpacking").strong());
-            ui.radio_value(&mut self.mode, Mode::Keep, "Keep the repack (safe; needs space for the repack and the game)");
-            ui.radio_value(&mut self.mode, Mode::DeleteEach, "Delete each data file once it is fully unpacked (safe)");
-            ui.radio_value(
-                &mut self.mode,
-                Mode::FreeAsRead,
-                RichText::new("Free the repack while reading it (least space; NOT safe: a crash loses the repack)")
-                    .color(ui.visuals().warn_fg_color),
-            );
+            card(ui, "While unpacking", |ui| {
+                let warn = ui.visuals().warn_fg_color;
+                for (mode, title, note, risky) in [
+                    (Mode::Keep, "Keep the repack", "Safe. Needs room for both the repack and the game.", false),
+                    (
+                        Mode::DeleteEach,
+                        "Delete each data file once it is fully unpacked",
+                        "Safe. Frees space as it goes; every file is checked first.",
+                        false,
+                    ),
+                    (
+                        Mode::FreeAsRead,
+                        "Free the repack while reading it",
+                        "Least space. NOT safe: a crash or power cut loses the repack.",
+                        true,
+                    ),
+                ] {
+                    ui.radio_value(&mut self.mode, mode, title);
+                    ui.add_space(-6.0);
+                    ui.indent(mode as u8, |ui| {
+                        let note = RichText::new(note).small();
+                        ui.label(if risky { note.color(warn) } else { note.weak() });
+                    });
+                }
+            });
         });
-        ui.add_space(8.0);
 
         ui.horizontal(|ui| {
-            if ui
-                .add_enabled(!running, egui::Button::new("Check space"))
-                .clicked()
-            {
-                self.start(&ctx, true);
-            }
-            if ui
-                .add_enabled(
-                    !running,
-                    egui::Button::new(RichText::new("Unpack").strong()),
-                )
-                .clicked()
-            {
+            let unpack = egui::Button::new(RichText::new("Unpack").strong().color(Color32::WHITE))
+                .fill(ui.visuals().selection.bg_fill)
+                .min_size(egui::vec2(120.0, 32.0));
+            if ui.add_enabled(!running, unpack).clicked() {
                 if self.mode == Mode::Keep {
                     self.start(&ctx, false);
                 } else {
                     self.ask = Some(Ask::Extract);
                 }
             }
-            if ui.add_enabled(running, egui::Button::new("Stop")).clicked() {
+            let side = egui::vec2(0.0, 32.0);
+            if ui
+                .add_enabled(!running, egui::Button::new("Check space").min_size(side))
+                .clicked()
+            {
+                self.start(&ctx, true);
+            }
+            if ui
+                .add_enabled(running, egui::Button::new("Stop").min_size(side))
+                .clicked()
+            {
                 self.ask = Some(Ask::Stop);
             }
             if self.unpacked
                 && Path::new(&self.out).is_dir()
-                && ui.button("Open install folder").clicked()
+                && ui.button("📂 Open install folder").clicked()
             {
                 let _ = Command::new("explorer").arg(&self.out).spawn();
             }
         });
-        ui.small("unrepack runs the decoders that came with the download. Use repacks you trust.");
-        ui.add_space(6.0);
+        ui.label(
+            RichText::new(
+                "unrepack runs the decoders that came with the download. Use repacks you trust.",
+            )
+            .small()
+            .weak(),
+        );
 
         if let Some((phase, done, total)) = &self.progress {
             let frac = *done as f32 / (*total).max(1) as f32;
@@ -474,13 +571,18 @@ impl App {
                 ("extracting", Mode::DeleteEach | Mode::FreeAsRead) => "Step 2 of 2: unpacking",
                 _ => "Unpacking",
             };
-            ui.label(step);
-            ui.add(egui::ProgressBar::new(frac).text(format!(
-                "{:.0}%   {} of {}",
-                frac * 100.0,
-                human(*done),
-                human(*total)
-            )));
+            ui.label(RichText::new(step).strong());
+            ui.add(
+                egui::ProgressBar::new(frac)
+                    .desired_height(22.0)
+                    .animate(running)
+                    .text(format!(
+                        "{:.0}%   {} of {}",
+                        frac * 100.0,
+                        human(*done),
+                        human(*total)
+                    )),
+            );
         } else if running {
             ui.horizontal(|ui| {
                 ui.spinner();
@@ -488,35 +590,36 @@ impl App {
             });
         }
 
-        match &self.outcome {
-            Some(Outcome::Ok(m)) => {
-                ui.label(
-                    RichText::new(m)
-                        .color(Color32::from_rgb(60, 170, 90))
-                        .strong(),
-                );
-            }
-            Some(Outcome::Failed(m)) => {
-                ui.label(RichText::new(m).color(ui.visuals().error_fg_color).strong());
-            }
-            Some(Outcome::Stopped(m)) => {
-                ui.label(RichText::new(m).color(ui.visuals().warn_fg_color).strong());
-            }
-            None => {}
+        let shown = match &self.outcome {
+            Some(Outcome::Ok(m)) => Some((OK_GREEN, m)),
+            Some(Outcome::Failed(m)) => Some((ui.visuals().error_fg_color, m)),
+            Some(Outcome::Stopped(m)) => Some((ui.visuals().warn_fg_color, m)),
+            None => None,
+        };
+        if let Some((color, m)) = shown {
+            banner(ui, color, |ui| {
+                ui.label(RichText::new(m).color(color).strong());
+            });
         }
-        ui.add_space(6.0);
 
+        ui.add_space(2.0);
         ui.label(RichText::new("Log").strong());
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            egui::ScrollArea::vertical()
-                .stick_to_bottom(true)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    for l in &self.log {
-                        ui.label(RichText::new(l).monospace().size(12.0));
-                    }
-                });
-        });
+        egui::Frame::group(ui.style())
+            .fill(ui.visuals().extreme_bg_color)
+            .inner_margin(8)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .stick_to_bottom(true)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if self.log.is_empty() {
+                            ui.label(RichText::new("The CLI's output appears here.").weak());
+                        }
+                        for l in &self.log {
+                            ui.label(RichText::new(l).monospace().size(12.0));
+                        }
+                    });
+            });
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
@@ -608,7 +711,9 @@ impl eframe::App for App {
                 self.ask = Some(Ask::Close);
             }
         }
-        egui::CentralPanel::default().show(ui, |ui| self.body(ui));
+        egui::CentralPanel::default()
+            .frame(egui::Frame::central_panel(ui.style()).inner_margin(16))
+            .show(ui, |ui| self.body(ui));
         self.dialogs(&ctx);
     }
 }
@@ -617,14 +722,17 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("unrepack")
-            .with_inner_size([780.0, 640.0])
+            .with_inner_size([820.0, 760.0])
             .with_min_inner_size([560.0, 460.0]),
         ..Default::default()
     };
     eframe::run_native(
         "unrepack",
         options,
-        Box::new(|_cc| Ok(Box::new(App::new()))),
+        Box::new(|cc| {
+            theme(&cc.egui_ctx);
+            Ok(Box::new(App::new()))
+        }),
     )
 }
 
