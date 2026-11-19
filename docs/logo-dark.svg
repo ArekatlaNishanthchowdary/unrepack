@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="400" height="96" viewBox="0 0 400 96" role="img" aria-label="unrepack">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5EC386"/>
+      <stop offset="1" stop-color="#3D8A5C"/>
+    </linearGradient>
+  </defs>
+  <rect width="96" height="96" rx="24" fill="url(#g)"/>
+  <rect x="22" y="64" width="52" height="11" rx="5.5" fill="#FFFFFF"/>
+  <rect x="22" y="48" width="52" height="11" rx="5.5" fill="#FFFFFF"/>
+  <rect x="22" y="25" width="52" height="11" rx="5.5" fill="#FFFFFF" opacity="0.85" transform="rotate(-14 48 30.5)"/>
+  <text x="118" y="66" fill="#F1F4F2" font-family="'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="56" font-weight="700" letter-spacing="-1">unrepack</text>
+</svg>
