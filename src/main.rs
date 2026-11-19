@@ -136,13 +136,22 @@ fn setup_in(dir: &Path) -> Option<PathBuf> {
 
 /// The steps Setup.exe's script takes, when following them matters (see
 /// [`recipe::needed`]). A script unrepack can't read is passed over: the
-/// data files still extract by name, as before.
+/// data files still extract by name, as before. A Setup.exe that can't be
+/// opened at all (an antivirus blocking it) is refused: its steps may be
+/// needed, and name order would quietly leave them out.
 fn recipe_for(dir: &Path) -> Result<Option<Vec<recipe::Step>>> {
     let Some(setup) = setup_in(dir) else {
         return Ok(None);
     };
-    let Ok(Some(code)) = inno::script(&setup) else {
-        return Ok(None);
+    let code = match inno::script(&setup) {
+        Ok(Some(c)) => c,
+        Err(e) if e.downcast_ref::<std::io::Error>().is_some() => {
+            return Err(e.context(
+                "Setup.exe holds the repack's install steps; if an antivirus blocked it, \
+                 restore it (or exclude this folder) and run again",
+            ));
+        }
+        _ => return Ok(None),
     };
     let calls = match ifps::Script::parse(&code).and_then(|s| s.calls("CurStepChanged")) {
         Ok(c) => c,
@@ -1241,6 +1250,21 @@ mod tests {
             if exe == r"{tmp}\work\build01.bat"
                 && params.is_empty()
                 && dir == r"{app}\archive\pc\content\audio_2_soundbanks\")));
+    }
+
+    #[test]
+    fn unreadable_setup_is_refused_other_setups_fall_back() {
+        let d = std::env::temp_dir().join(format!("unrepack-setup-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("setup.exe"), b"MZ not inno").unwrap();
+        assert!(recipe_for(&d).unwrap().is_none());
+        // A folder can't be read as a file: stands in for one an antivirus blocks.
+        fs::remove_file(d.join("setup.exe")).unwrap();
+        fs::create_dir(d.join("setup.exe")).unwrap();
+        let e = recipe_for(&d).unwrap_err();
+        assert!(format!("{e:#}").contains("antivirus"), "{e:#}");
+        fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]
