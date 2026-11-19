@@ -366,8 +366,19 @@ mod tests {
 
     #[test]
     fn product_takes_only_a_plain_relative_path() {
-        assert_eq!(product(r"archive\pc\ep1\x.archive"), Some(r"archive\pc\ep1\x.archive"));
-        for bad in ["Preparing installation...", "...", "", r"\x\y", r"C:\x\y", r"a\..\..\y", r"a\\y"] {
+        assert_eq!(
+            product(r"archive\pc\ep1\x.archive"),
+            Some(r"archive\pc\ep1\x.archive")
+        );
+        for bad in [
+            "Preparing installation...",
+            "...",
+            "",
+            r"\x\y",
+            r"C:\x\y",
+            r"a\..\..\y",
+            r"a\\y",
+        ] {
             assert_eq!(product(bad), None, "{bad}");
         }
     }

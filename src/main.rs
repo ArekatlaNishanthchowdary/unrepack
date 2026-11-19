@@ -345,7 +345,9 @@ fn setup_step(
                 )?;
             }
         }
-        recipe::Step::Run { exe, params, dir, .. } => run_setup_cmd(exe, params, dir, pl)?,
+        recipe::Step::Run {
+            exe, params, dir, ..
+        } => run_setup_cmd(exe, params, dir, pl)?,
         recipe::Step::DelTree(d) => {
             let d = pl.inside(d)?;
             if d.is_dir() {
@@ -958,7 +960,10 @@ fn extract_cmd(a: Args) -> Result<()> {
                  unrepack can't tell which is meant"
             );
         }
-        say!("Setup.exe puts these in the game folder itself: {}", own.join(", "));
+        say!(
+            "Setup.exe puts these in the game folder itself: {}",
+            own.join(", ")
+        );
     }
     let out_volume = win::volume(&out)?;
     let same_volume = jobs
@@ -1132,16 +1137,16 @@ fn extract_cmd(a: Args) -> Result<()> {
         // A rebuild step that exits 0 without making its file would leave
         // the game folder short; Setup names the file it makes.
         for s in &steps[first..] {
-            if let recipe::Step::Run { makes, .. } = s {
-                if let Some(f) = recipe::product(makes) {
-                    let path = pl.app.join(f);
-                    ensure!(
-                        path.is_file(),
-                        "Setup's step should have made {}, but it isn't there; \
-                         the game folder is incomplete",
-                        path.display()
-                    );
-                }
+            if let recipe::Step::Run { makes, .. } = s
+                && let Some(f) = recipe::product(makes)
+            {
+                let path = pl.app.join(f);
+                ensure!(
+                    path.is_file(),
+                    "Setup's step should have made {}, but it isn't there; \
+                     the game folder is incomplete",
+                    path.display()
+                );
             }
         }
         let _ = fs::remove_dir(&dec.work);
@@ -1246,10 +1251,14 @@ mod tests {
                 "fg-01.bin"
             ]
         );
-        assert!(steps.iter().any(|s| matches!(s, recipe::Step::Run { exe, params, dir, .. }
+        assert!(
+            steps
+                .iter()
+                .any(|s| matches!(s, recipe::Step::Run { exe, params, dir, .. }
             if exe == r"{tmp}\work\build01.bat"
                 && params.is_empty()
-                && dir == r"{app}\archive\pc\content\audio_2_soundbanks\")));
+                && dir == r"{app}\archive\pc\content\audio_2_soundbanks\"))
+        );
     }
 
     #[test]
