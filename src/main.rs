@@ -202,9 +202,11 @@ fn set_ini(path: &Path, section: &str, key: &str, value: &str) -> Result<()> {
         .with_context(|| format!("writing {}", path.display()))
 }
 
-/// Runs one of Setup's commands and waits for it. A non-zero exit stops
-/// the run: FitGirl's rebuild steps chain with `&&`, so that means one
-/// failed. ponytail: output shows when it ends, not as it goes.
+/// Runs one of Setup's commands and waits for it. A missing program or
+/// folder stops the run; a non-zero exit is only logged, since some tools
+/// (fart counts its replacements) use it for other things than failure, as
+/// Setup ignores it too. FitGirl's hash list is the real check afterwards.
+/// ponytail: output shows when it ends, not as it goes.
 fn run_setup_cmd(exe: &str, params: &str, dir: &str, places: &recipe::Places) -> Result<()> {
     use std::os::windows::process::CommandExt;
     let (exe, params, dir) = (
@@ -223,7 +225,19 @@ fn run_setup_cmd(exe: &str, params: &str, dir: &str, places: &recipe::Places) ->
         dir.display()
     );
     let lower = exe.to_ascii_lowercase();
-    let mut cmd = if lower.ends_with(".bat") || lower.ends_with(".cmd") {
+    let script = lower.ends_with(".bat") || lower.ends_with(".cmd");
+    ensure!(
+        Path::new(&exe).is_file(),
+        "Setup runs {exe}, which isn't there"
+    );
+    if script {
+        // Kept in the log: the decoders' folder, which holds it, goes at the end.
+        say!("{exe}:");
+        for l in fs::read_to_string(&exe).unwrap_or_default().lines() {
+            say!("  | {l}");
+        }
+    }
+    let mut cmd = if script {
         let mut c = std::process::Command::new(places.expand("{cmd}")?);
         c.raw_arg(format!("/C \"\"{exe}\" {params}\""));
         c
@@ -245,11 +259,9 @@ fn run_setup_cmd(exe: &str, params: &str, dir: &str, places: &recipe::Places) ->
     {
         say!("  {l}");
     }
-    ensure!(
-        o.status.success(),
-        "{exe} {params} failed ({}); the game folder is incomplete",
-        o.status
-    );
+    if !o.status.success() {
+        note!("  {exe} ended with {}", o.status);
+    }
     Ok(())
 }
 
@@ -273,6 +285,7 @@ fn setup_step(
             data,
             tools: true,
             sub,
+            ..
         } => {
             let (f, _, arc) = tools
                 .iter()
@@ -345,11 +358,22 @@ fn extract_tools(job: &Job, sub: &str, dec: &Decoders, tmp: &Path) -> Result<()>
 
 /// A folder of decoders read out of Setup.exe, removed when the run ends.
 /// ponytail: a killed run leaves it in %TEMP%; sweep old ones if that piles up.
-struct Carved(PathBuf);
+struct Carved(PathBuf, std::cell::Cell<bool>);
+
+impl Carved {
+    /// Leaves the folder in place after a failed step, to look into.
+    fn keep(&self) {
+        if !self.1.replace(true) {
+            note!("Setup's tools and scripts are kept in {}", self.0.display());
+        }
+    }
+}
 
 impl Drop for Carved {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        if !self.1.get() {
+            let _ = fs::remove_dir_all(&self.0);
+        }
     }
 }
 
@@ -377,7 +401,7 @@ fn find_decoders(given: Option<&Path>, first: &Path) -> Result<Found> {
     // A run that was killed leaves its folder; a later run with the same id
     // must not mix that repack's decoders with this one's.
     let _ = fs::remove_dir_all(&tmp);
-    let carved = Carved(tmp.clone());
+    let carved = Carved(tmp.clone(), Default::default());
     match inno::carve(&setup, &tmp) {
         Ok(n) => {
             say!(
@@ -418,6 +442,20 @@ fn data_files(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
             // A language or extra left out of a download is often there in
             // part (the torrent's shared pieces): skip it, as the installer
             // does a missing one. A broken game file still stops the run.
+            let broken: Vec<String> = found
+                .iter()
+                .filter(|f| {
+                    number(&name(f)).is_some()
+                        && f.metadata().is_ok_and(|m| m.len() > 0)
+                        && !freearc::sniff(f)
+                })
+                .map(|f| name(f))
+                .collect();
+            ensure!(
+                broken.is_empty(),
+                "{} is damaged (its start is missing); download it again",
+                broken.join(", ")
+            );
             found.retain(|f| {
                 if !freearc::sniff(f) {
                     // ponytail: a language pack is the only name we know is
@@ -739,6 +777,7 @@ fn extract_cmd(a: Args) -> Result<()> {
                     data,
                     tools: t,
                     sub,
+                    ..
                 } = s
                 else {
                     continue;
@@ -751,6 +790,13 @@ fn extract_cmd(a: Args) -> Result<()> {
                     tools.push((path, sub.clone(), arc));
                 } else if let Some(f) = files.iter().find(|f| lname(f) == data.to_lowercase()) {
                     app.push(f.clone());
+                } else {
+                    // A language or extra left out is a choice; the game isn't.
+                    ensure!(
+                        number(data).is_none(),
+                        "Setup.exe unpacks {data}, which is missing, empty or not chosen; \
+                         the game can't be installed without it"
+                    );
                 }
             }
             for f in &files {
@@ -973,7 +1019,8 @@ fn extract_cmd(a: Args) -> Result<()> {
                 .filter(|s| matches!(s, recipe::Step::Extract { tools: true, .. })),
         );
         for s in early {
-            setup_step(s, pl, &tools, &[], &dec, &mut Progress::new(0))?;
+            setup_step(s, pl, &tools, &[], &dec, &mut Progress::new(0))
+                .inspect_err(|_| carved.iter().for_each(Carved::keep))?;
         }
     }
 
@@ -1028,9 +1075,29 @@ fn extract_cmd(a: Args) -> Result<()> {
     }
     let mut p = Progress::new(total_out);
     if let (Some(steps), Some(pl)) = (&steps, &places) {
+        // What Setup installs into the game folder itself: FitGirl's hash
+        // lists, one per component, which its last step joins up.
+        let chosen: Vec<&str> = steps
+            .iter()
+            .filter_map(|s| match s {
+                recipe::Step::Extract {
+                    data,
+                    component: Some(c),
+                    ..
+                } if jobs.iter().any(|(f, _)| lname(f) == data.to_lowercase()) => Some(c.as_str()),
+                _ => None,
+            })
+            .collect();
+        if let Some(setup) = setup_in(&src_dir) {
+            let n = inno::carve_app(&setup, &out, &|c| {
+                chosen.iter().any(|x| x.eq_ignore_ascii_case(c))
+            })?;
+            say!("copied {n} file(s) Setup.exe puts in the game folder itself");
+        }
         for s in &steps[first..] {
             if !matches!(s, recipe::Step::Extract { tools: true, .. }) {
-                setup_step(s, pl, &tools, &jobs, &dec, &mut p)?;
+                setup_step(s, pl, &tools, &jobs, &dec, &mut p)
+                    .inspect_err(|_| carved.iter().for_each(Carved::keep))?;
             }
         }
         let _ = fs::remove_dir(&dec.work);

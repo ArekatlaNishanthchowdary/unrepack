@@ -22,10 +22,12 @@ pub enum Step {
     /// ISArcExtract of `{src}\<data>`. `tools` unpacks into `{tmp}` (the
     /// installer's own helpers), else into `{app}`. `sub`: only what is
     /// under that folder in the archive, with the folder taken off.
+    /// `component`: the wizard choice it belongs to (`local\eng`), if any.
     Extract {
         data: String,
         tools: bool,
         sub: String,
+        component: Option<String>,
     },
     /// ISExec: a program, its parameters and the folder it runs in.
     Run {
@@ -74,8 +76,21 @@ fn plain(path: &str, place: &str) -> Option<String> {
 /// The steps in script order, or why the script can't be followed.
 pub fn steps(calls: &[Call]) -> Result<Vec<Step>> {
     let mut out = Vec::new();
+    // ISDone numbers components from 1 in the order the script asks
+    // IsComponentSelected about them.
+    let mut comps: Vec<String> = Vec::new();
     for c in calls {
         let name = c.name.as_str();
+        // FitGirl's "limit RAM" choices, off unless ticked.
+        if c.optional {
+            continue;
+        }
+        if name.eq_ignore_ascii_case("ISCOMPONENTSELECTED")
+            && let Ok(s) = text(c, 0)
+            && !comps.iter().any(|x| x.eq_ignore_ascii_case(s))
+        {
+            comps.push(s.to_string());
+        }
         if UNSUPPORTED.iter().any(|u| u.eq_ignore_ascii_case(name)) {
             bail!("Setup calls {name}, which unrepack can't do yet");
         }
@@ -100,7 +115,16 @@ pub fn steps(calls: &[Call]) -> Result<Vec<Step>> {
                     !sub.split('\\').any(|p| p == ".." || p.contains(':')),
                     "Setup unpacks {data} from an odd folder: {sub}"
                 );
-                out.push(Step::Extract { data, tools, sub });
+                let component = match c.args.first() {
+                    Some(Val::Int(k)) if *k >= 1 => comps.get(*k as usize - 1).cloned(),
+                    _ => None,
+                };
+                out.push(Step::Extract {
+                    data,
+                    tools,
+                    sub,
+                    component,
+                });
             }
             "ISEXEC" => {
                 // (component, progress, time, file, params, folder, label, show)
@@ -204,6 +228,7 @@ mod tests {
         Call {
             name: name.into(),
             args: args.iter().map(|a| Val::Str(a.to_string())).collect(),
+            optional: false,
         }
     }
 
@@ -259,14 +284,27 @@ mod tests {
             ),
             call("Exec2", &["{uninstallexe}", "/VERYSILENT", ""]),
         ];
+        let mut calls = calls;
+        // Ticked only: skipped.
+        let mut low_ram = call(
+            "SETINISTRING",
+            &["Srep", "Memory", "512m", r"{tmp}\CLS.ini"],
+        );
+        low_ram.optional = true;
+        calls.insert(0, low_ram);
+        calls.insert(0, call("ISCOMPONENTSELECTED", &[r"local\eng"]));
+        let mut eng = extract(r"{src}\fg-selective-english-vo.bin", r"{app}\", "");
+        eng.args[0] = Val::Int(1);
+        calls.push(eng);
         let s = steps(&calls).unwrap();
-        assert_eq!(s.len(), 6);
+        assert_eq!(s.len(), 7);
         assert_eq!(
             s[1],
             Step::Extract {
                 data: "fg-07.bin".into(),
                 tools: true,
-                sub: String::new()
+                sub: String::new(),
+                component: None,
             }
         );
         assert_eq!(
@@ -274,9 +312,11 @@ mod tests {
             Step::Extract {
                 data: "fg-08.bin".into(),
                 tools: true,
-                sub: "work".into()
+                sub: "work".into(),
+                component: None,
             }
         );
+        assert!(matches!(&s[6], Step::Extract { component: Some(c), .. } if c == r"local\eng"));
         assert!(needed(&s));
         assert!(!needed(&s[2..3]));
 

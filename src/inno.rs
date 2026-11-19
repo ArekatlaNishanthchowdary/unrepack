@@ -206,26 +206,36 @@ fn safe_name(n: &str) -> bool {
     })
 }
 
-/// `(name, location index)` of every file the installer puts straight into
-/// `{tmp}`. ponytail: found by searching block 0 for "{tmp}\" names instead
-/// of parsing every header section before the file entries; the entry is the
-/// destination string, 8 more strings, MinVersion and OnlyBelowVersion (10
-/// bytes each), then the location index.
-fn tmp_files(h0: &[u8], count: usize) -> Vec<(String, usize)> {
-    let pat: Vec<u8> = "{tmp}\\"
-        .encode_utf16()
-        .flat_map(u16::to_le_bytes)
-        .collect();
+/// `(name, location index)` of every file the installer puts into `place`
+/// (`{tmp}` or `{app}`) whose component `keep` accepts; none is "". ponytail:
+/// found by searching block 0 for "<place>\" names instead of parsing every
+/// header section before the file entries; the entry is the destination
+/// string, 8 more strings (the third is its components), MinVersion and
+/// OnlyBelowVersion (10 bytes each), then the location index.
+fn setup_files(
+    h0: &[u8],
+    count: usize,
+    place: &str,
+    keep: &dyn Fn(&str) -> bool,
+) -> Vec<(String, usize)> {
+    let prefix = format!("{place}\\");
+    let pat: Vec<u8> = prefix.encode_utf16().flat_map(u16::to_le_bytes).collect();
     let mut out: Vec<(String, usize)> = Vec::new();
     for at in (4..h0.len().saturating_sub(pat.len())).filter(|&i| h0[i..].starts_with(&pat)) {
         let entry = (|| {
             let (dest, mut j) = wstr(h0, at - 4)?;
-            for _ in 0..8 {
-                j = wstr(h0, j)?.1;
+            let mut comp = String::new();
+            for k in 0..8 {
+                let (s, next) = wstr(h0, j)?;
+                if k == 2 {
+                    comp = s;
+                }
+                j = next;
             }
             let loc = i32::from_le_bytes(h0.get(j + 20..j + 24)?.try_into().ok()?);
-            let name = dest.strip_prefix("{tmp}\\")?.to_string();
-            (safe_name(&name) && (0..count as i32).contains(&loc)).then_some((name, loc as usize))
+            let name = dest.strip_prefix(&prefix)?.to_string();
+            (safe_name(&name) && (0..count as i32).contains(&loc) && keep(&comp))
+                .then_some((name, loc as usize))
         })();
         if let Some((name, loc)) = entry
             && !out.iter().any(|(n, _)| n.eq_ignore_ascii_case(&name))
@@ -276,6 +286,24 @@ pub fn script(setup: &Path) -> Result<Option<Vec<u8>>> {
 /// Writes the files the installer would put in `{tmp}` (its decoders among
 /// them) into `out`, each checked against its SHA-1. Returns how many.
 pub fn carve(setup: &Path, out: &Path) -> Result<usize> {
+    let n = carve_place(setup, "{tmp}", out, &|_| true)?;
+    ensure!(n > 0, "Setup.exe puts no files in {{tmp}}");
+    Ok(n)
+}
+
+/// The files the installer itself puts in the game folder, for the
+/// components `keep` accepts (FitGirl's `_Redist\fitgirl.md5` and a hash list
+/// per language). Returns how many.
+pub fn carve_app(setup: &Path, out: &Path, keep: &dyn Fn(&str) -> bool) -> Result<usize> {
+    carve_place(setup, "{app}", out, &|c| c.is_empty() || keep(c))
+}
+
+fn carve_place(
+    setup: &Path,
+    place: &str,
+    out: &Path,
+    keep: &dyn Fn(&str) -> bool,
+) -> Result<usize> {
     let data = fs::read(setup).with_context(|| format!("reading {}", setup.display()))?;
     let Some(id) = data.windows(ID.len()).rposition(|w| w == ID) else {
         bail!("not an Inno Setup 5.5 installer, the only kind unrepack can read the decoders from");
@@ -288,8 +316,10 @@ pub fn carve(setup: &Path, out: &Path) -> Result<usize> {
         "Setup.exe's file table isn't the Inno Setup 5.5 kind"
     );
     let recs: Vec<&[u8]> = h1.chunks(REC).collect();
-    let files = tmp_files(&h0, recs.len());
-    ensure!(!files.is_empty(), "Setup.exe puts no files in {{tmp}}");
+    let files = setup_files(&h0, recs.len(), place, keep);
+    if files.is_empty() {
+        return Ok(0);
+    }
 
     // The data area starts at the first "zlb\x1a" that every chunk offset
     // lines up from.
@@ -345,7 +375,7 @@ pub fn carve(setup: &Path, out: &Path) -> Result<usize> {
                 sha1(&file) == r[36..56],
                 "{name} from Setup.exe doesn't match its SHA-1"
             );
-            if name.to_ascii_lowercase().ends_with(".ini") {
+            if place == "{tmp}" && name.to_ascii_lowercase().ends_with(".ini") {
                 file = patch_ini(&file);
             }
             let path = out.join(name);
@@ -468,7 +498,7 @@ mod tests {
         ]
         .concat();
         assert_eq!(
-            tmp_files(&h0, 3),
+            setup_files(&h0, 3, "{tmp}", &|_| true),
             [("cls.ini".to_string(), 1), ("arc.ini".to_string(), 0)]
         );
     }

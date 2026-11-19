@@ -43,6 +43,8 @@ mod bt {
 pub enum Val {
     Str(String),
     Int(i64),
+    /// Whether a wizard checkbox is ticked (`true`), or its opposite.
+    Ticked(bool),
     #[default]
     Unknown,
 }
@@ -52,6 +54,9 @@ pub enum Val {
 pub struct Call {
     pub name: String,
     pub args: Vec<Val>,
+    /// Made only when a checkbox on the wizard is ticked (FitGirl's
+    /// "limit RAM" option), which it isn't by default.
+    pub optional: bool,
 }
 
 struct Type {
@@ -304,11 +309,19 @@ impl Script {
             base: 1,
         };
         let mut out = Vec::new();
-        self.walk(i, &mut m, &mut out, 0)?;
+        self.walk(i, &mut m, &mut out, 0, false)?;
         Ok(out)
     }
 
-    fn walk(&self, proc: usize, m: &mut Mem, out: &mut Vec<Call>, depth: usize) -> Result<()> {
+    /// `optional`: the caller only gets here with a checkbox ticked.
+    fn walk(
+        &self,
+        proc: usize,
+        m: &mut Mem,
+        out: &mut Vec<Call>,
+        depth: usize,
+        optional: bool,
+    ) -> Result<()> {
         let Proc::Internal { code, .. } = &self.procs[proc] else {
             unreachable!()
         };
@@ -316,7 +329,12 @@ impl Script {
             b: &self.data[code.clone()],
             at: 0,
         };
+        // Ends of code that runs only with a checkbox ticked.
+        let mut ticked_until: Vec<usize> = Vec::new();
+        let mut flag = Val::Unknown;
         while r.at < r.b.len() {
+            ticked_until.retain(|&end| r.at < end);
+            let optional = optional || !ticked_until.is_empty();
             let op = r.u8()?;
             match op {
                 0 => {
@@ -368,28 +386,49 @@ impl Script {
                             if *result && let Some(v) = result_of(name, &args) {
                                 m.set(Some(Loc::Stack(top)), v);
                             }
+                            if name.ends_with("|CHECKED|") {
+                                for i in top.saturating_sub(*params)..m.stack.len() {
+                                    m.set(Some(Loc::Stack(i)), Val::Ticked(true));
+                                }
+                            }
                             out.push(Call {
                                 name: name.clone(),
                                 args,
+                                optional,
                             });
                         }
                         Proc::Internal { .. } if depth < 8 => {
                             m.stack.push(Cell::default()); // return address
                             let (keep, base) = (m.stack.len(), m.base);
                             m.base = keep - 1;
-                            self.walk(n, m, out, depth + 1)?;
+                            self.walk(n, m, out, depth + 1, optional)?;
                             m.stack.truncate(keep - 1);
                             m.base = base;
                         }
                         Proc::Internal { .. } => bail!("script: calls nest too deep"),
                     }
                 }
-                6 | 18 | 25 | 26 => {
+                18 => {
+                    // jump if the flag is set; see 7 and 8
+                    let skip = r.u32()? as usize;
+                    if flag == Val::Ticked(false) {
+                        ticked_until.push(r.at + skip);
+                    }
+                }
+                6 | 25 | 26 => {
                     r.u32()?;
                 }
                 7 | 8 => {
-                    r.u32()?;
-                    self.var(&mut r, m)?;
+                    // Jump if the variable is true (7) or false (8). The code
+                    // skipped over runs only when the checkbox is ticked if
+                    // the jump is taken when it isn't.
+                    let skip = r.u32()? as usize;
+                    let v = self.var(&mut r, m)?;
+                    if let Val::Ticked(t) = m.get(v)
+                        && t == (op == 8)
+                    {
+                        ticked_until.push(r.at + skip);
+                    }
                 }
                 9 => break,
                 10 => {
@@ -407,7 +446,16 @@ impl Script {
                     self.read(&mut r, m)?;
                     m.set(d, Val::Unknown);
                 }
-                13 | 15 | 16 | 21 | 23 | 24 => {
+                15 => {
+                    // boolean not
+                    let d = self.var(&mut r, m)?;
+                    let v = match m.get(d) {
+                        Val::Ticked(t) => Val::Ticked(!t),
+                        _ => Val::Unknown,
+                    };
+                    m.set(d, v);
+                }
+                13 | 16 | 21 | 23 | 24 => {
                     let d = self.var(&mut r, m)?;
                     m.set(d, Val::Unknown);
                 }
@@ -416,8 +464,13 @@ impl Script {
                     self.var(&mut r, m)?;
                 }
                 17 => {
-                    self.var(&mut r, m)?;
-                    r.u8()?;
+                    // set the flag from a variable, or from its opposite
+                    let v = self.var(&mut r, m)?;
+                    let not = r.u8()? != 0;
+                    flag = match m.get(v) {
+                        Val::Ticked(t) => Val::Ticked(t != not),
+                        _ => Val::Unknown,
+                    };
                 }
                 19 => {
                     r.bytes(16)?;
@@ -541,6 +594,7 @@ fn result_of(name: &str, args: &[Val]) -> Option<Val> {
     match name.to_ascii_uppercase().as_str() {
         // Left as-is: the caller maps {app}, {tmp} and {src} itself.
         "EXPANDCONSTANT" | "REMOVEBACKSLASH" => args.first().cloned(),
+        "CLASS:TCHECKBOX|CHECKED|" | "CLASS:TNEWCHECKBOX|CHECKED|" => Some(Val::Ticked(true)),
         "ADDBACKSLASH" => Some(match args.first() {
             Some(Val::Str(s)) if !s.ends_with('\\') => Val::Str(format!("{s}\\")),
             Some(v) => v.clone(),
@@ -557,5 +611,84 @@ fn result_of(name: &str, args: &[Val]) -> Option<Val> {
         // Unknown result, or a procedure with none: the slot below stays
         // as pushed, unknown.
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A unicode-string constant operand.
+    fn text(s: &str) -> Vec<u8> {
+        let mut b = vec![1, 0, 0, 0, 0]; // constant of type 0
+        b.extend((s.encode_utf16().count() as u32).to_le_bytes());
+        b.extend(s.encode_utf16().flat_map(u16::to_le_bytes));
+        b
+    }
+
+    fn lstr(s: &[u8]) -> Vec<u8> {
+        [&(s.len() as u32).to_le_bytes()[..], s].concat()
+    }
+
+    /// CurStepChanged doing SetIniString('S', 'K', ExpandConstant('{app}'),
+    /// 'F'), with ExpandConstant's result passed by reference, as the
+    /// compiler does.
+    #[test]
+    fn walks_calls_and_references() {
+        let slot = |k: u32| (STACK_START + k).to_le_bytes();
+        let mut code = Vec::new();
+        code.push(2);
+        code.extend(text("F")); // [2] file
+        code.extend([11, 0, 0, 0, 0]); // [3] value slot
+        code.push(2);
+        code.extend(text("{app}")); // [4] ExpandConstant's argument
+        code.extend([3, 0]);
+        code.extend(slot(2)); // [5] its result: a reference to [3]
+        code.extend([5, 0, 0, 0, 0, 4, 4]);
+        code.push(2);
+        code.extend(text("K"));
+        code.push(2);
+        code.extend(text("S"));
+        code.extend([11, 0, 0, 0, 0]); // SetIniString's result
+        code.extend([5, 1, 0, 0, 0, 9]);
+
+        let mut procs = Vec::new();
+        for (name, decl) in [
+            ("EXPANDCONSTANT", &[1u8, 0][..]),
+            ("SETINISTRING", &[1, 0, 0, 0, 0]),
+        ] {
+            procs.push(3);
+            procs.push(name.len() as u8);
+            procs.extend(name.as_bytes());
+            procs.extend(lstr(decl));
+        }
+        let head_len =
+            28 + 1 + procs.len() + 1 + 8 + lstr(b"CURSTEPCHANGED").len() + lstr(b"").len();
+        procs.push(2);
+        procs.extend((head_len as u32).to_le_bytes());
+        procs.extend((code.len() as u32).to_le_bytes());
+        procs.extend(lstr(b"CURSTEPCHANGED"));
+        procs.extend(lstr(b""));
+
+        let mut data = Vec::new();
+        for v in [HEADER, 20, 1, 3, 0, 2, 0] {
+            data.extend(v.to_le_bytes());
+        }
+        data.push(bt::UNICODESTRING);
+        data.extend(procs);
+        assert_eq!(data.len(), head_len);
+        data.extend(code);
+
+        let calls = Script::parse(&data)
+            .unwrap()
+            .calls("CurStepChanged")
+            .unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].args, [Val::Str("{app}".into())]);
+        assert_eq!(calls[1].name, "SETINISTRING");
+        assert_eq!(
+            calls[1].args,
+            ["S", "K", "{app}", "F"].map(|s| Val::Str(s.into()))
+        );
     }
 }
