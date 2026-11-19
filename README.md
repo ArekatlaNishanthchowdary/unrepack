@@ -13,7 +13,7 @@
   <a href="https://github.com/ArekatlaNishanthchowdary/unrepack/releases/latest"><img src="https://img.shields.io/github/v/release/ArekatlaNishanthchowdary/unrepack?style=for-the-badge&label=release&color=1f6feb" alt="Latest release" /></a>
   <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-e8743b?style=for-the-badge" alt="MIT or Apache-2.0 licensed, except src/builtin.rs and src/tornado.rs" /></a>
   <a href="https://github.com/ArekatlaNishanthchowdary/unrepack/releases"><img src="https://img.shields.io/github/downloads/ArekatlaNishanthchowdary/unrepack/total?style=for-the-badge&label=downloads&color=3fb950" alt="Downloads" /></a>
-  <a href="#sponsor"><img src="https://img.shields.io/badge/sponsor-UPI-ea4aaa?style=for-the-badge&logo=githubsponsors&logoColor=white" alt="Sponsor over UPI" /></a>
+  <a href="https://github.com/sponsors/ArekatlaNishanthchowdary"><img src="https://img.shields.io/github/sponsors/ArekatlaNishanthchowdary?style=for-the-badge&logo=githubsponsors&logoColor=white&label=sponsor&color=ea4aaa" alt="Sponsor on GitHub" /></a>
   <a href="https://github.com/ArekatlaNishanthchowdary/unrepack/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/ArekatlaNishanthchowdary/unrepack/ci.yml?branch=master&style=for-the-badge&label=ci" alt="CI status" /></a>
   <img src="https://img.shields.io/badge/platform-windows-4ca571?style=for-the-badge" alt="Windows only" />
 </p>
@@ -184,7 +184,7 @@ cargo test --release
 
 ## Sponsor
 
-If unrepack saved you a download or some disk space, you can support it over UPI: scan the code with any UPI app, or pay `nishanthchowdary1234@pingpay`.
+If unrepack saved you a download or some disk space, you can support it on [GitHub Sponsors](https://github.com/sponsors/ArekatlaNishanthchowdary). In India, you can also pay over UPI: scan the code with any UPI app, or pay `nishanthchowdary1234@pingpay`.
 
 <p align="center">
   <img src="docs/upi-qr.png" width="240" alt="UPI QR code for nishanthchowdary1234@pingpay">
