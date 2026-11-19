@@ -33,7 +33,7 @@ A repack's installer needs room for the repack **and** the whole game at once. C
 
 ### The app
 
-Run `unrepack-gui.exe` as administrator; the repacks' decoders don't work without it. Pick the repack folder and where to install; the decoders are read out of the repack's `Setup.exe`, so their folder can stay empty. Then choose what happens to the repack and press **Check space** or **Unpack**. The app runs `unrepack.exe` next to it and shows its progress and log, so it does exactly what the command line does, with the same checks. It asks before any mode that deletes or frees the repack, and before stopping a run that would lose it.
+Run `unrepack-gui.exe` as administrator; the repacks' decoders don't work without it. Pick the repack folder and where to install. If the repack offers languages or extras (movies, artwork, soundtracks), tick the ones you want, as in the installer: English starts ticked and the other languages don't. The decoders are read out of the repack's `Setup.exe`, so their folder can stay empty. Then choose what happens to the repack and press **Check space** or **Unpack**. The app runs `unrepack.exe` next to it and shows its progress and log, so it does exactly what the command line does, with the same checks. It asks before any mode that deletes or frees the repack, and before stopping a run that would lose it.
 
 Keep `unrepack-gui.exe`, `unrepack.exe` and `unrepack-clshost.exe` in the same folder.
 
@@ -52,10 +52,21 @@ unrepack extract "Game [DODI Repack]" -o "D:\Games\Game"                  # keep
 unrepack extract "Game [DODI Repack]" -o "D:\Games\Game" --delete-each    # delete each data file once it's out
 unrepack extract "Game [DODI Repack]" -o "D:\Games\Game" --free-as-read   # free the repack while reading it
 unrepack list "Game [DODI Repack]\data1.doi"                                # what's inside
+unrepack parts "Game [DODI Repack]"                                         # which data files are languages or extras
 unrepack decoders "Game [DODI Repack]\Setup.exe" -o <folder>               # copy the decoders out
 ```
 
 The input can be a repack folder (every FreeArc data file in it is used) or one or more data files.
+
+### Languages and extras
+
+Repacks put each language and each extra in a data file of its own, and the installer asks which to install. `unrepack parts` sorts a folder's data files by name: DODI's `data<N>` and FitGirl's `fg-<N>` always install, language packs (`English.doi`, `fg-selective-french.bin`) are languages, and anything else is an extra. To choose, name the data files you want:
+
+```bash
+unrepack extract "Game [DODI Repack]\data1.doi" "Game [DODI Repack]\data2.doi" "Game [DODI Repack]\English.doi" -o "D:\Games\Game"
+```
+
+Language packs often hold the same file, such as `sound\desktop.ini`. As with the installer, the copy from the data file named later is kept, and unrepack says which. The sorting goes by file names alone. The installer's own choices and defaults are in its compiled script, which unrepack doesn't read.
 
 The repack's own decoders are needed too: `cls-*.dll` plug-ins, their `cls-*_x64.exe` / `cls-*_x86.exe` helpers, `cls.ini`, and `arc.ini` with any external decoders it names (FitGirl's `rzw.exe`, for example). unrepack reads them out of the repack's `Setup.exe` (Inno Setup 5.5, as DODI and FitGirl use) into a temporary folder, the way the installer would put them in `{tmp}`, without running anything in it. Every file is checked against the SHA-1 the installer stores, Inno's CALL/JMP filter is undone, and `{app}` / `{tmp}` in the `.ini` files become the decoders' working folder. The folder is removed when the run ends. `--decoders <folder>` uses a folder of decoders instead, and so does a repack folder that already holds them. Antivirus programs often flag a repack's `Setup.exe` (Windows Defender removed FitGirl's as `HackTool:Win32/Crack!MTB` when unrepack opened it); without it, unrepack says so and needs `--decoders`.
 
@@ -112,7 +123,8 @@ No repack using `tor` or `lzma` has been tried yet. Archives made by FreeArc 0.6
 | `4x4` around an external decoder or a built-in above | Works |
 | Other FreeArc built-ins (`ppmd`, `rep`, `exe`, `lzma2`, …), and `4x4` around a CLS plug-in | Not yet: refused before anything is changed |
 | Resume after a crash | Not in 0.1 |
-| Installer steps (registry, redistributables, language choice, post-install patches such as FitGirl's RTPatch `.x3` files and `restore-duplicates.bat`) | Not done. Only the files inside the data files are extracted |
+| Choosing languages and extras | Works, by data file name: `unrepack parts`, and tick boxes in the app |
+| Installer steps (registry, redistributables, post-install patches such as FitGirl's RTPatch `.x3` files and `restore-duplicates.bat`) | Not done. Only the files inside the data files are extracted |
 
 ## Is unrepack safe
 

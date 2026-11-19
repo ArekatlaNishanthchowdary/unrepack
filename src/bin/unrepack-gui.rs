@@ -24,9 +24,51 @@ enum Mode {
     FreeAsRead,
 }
 
+/// One data file, as `unrepack parts` describes it.
+#[derive(Clone, PartialEq, Debug)]
+struct Part {
+    kind: String,
+    on: bool,
+    unpacked: u64,
+    name: String,
+}
+
+/// `unrepack parts` output: kind, on/off, packed, unpacked, name per line.
+fn parse_parts(text: &str) -> Vec<Part> {
+    text.lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.trim_end_matches('\r').splitn(5, '\t').collect();
+            let [kind, on, _, unpacked, name] = f.as_slice() else {
+                return None;
+            };
+            Some(Part {
+                kind: kind.to_string(),
+                on: *on == "on",
+                unpacked: unpacked.parse().ok()?,
+                name: name.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// What to extract: the folder when every part is ticked (or none are
+/// known), else the ticked data files by name.
+fn inputs(repack: &str, parts: &[Part]) -> Vec<String> {
+    if parts.iter().all(|p| p.on) {
+        return vec![repack.into()];
+    }
+    parts
+        .iter()
+        .filter(|p| p.on)
+        .map(|p| Path::new(repack).join(&p.name).display().to_string())
+        .collect()
+}
+
 /// The CLI's arguments for one run. `--yes` because the window asks instead.
-fn cli_args(repack: &str, out: &str, decoders: &str, mode: Mode, check: bool) -> Vec<String> {
-    let mut a: Vec<String> = vec!["extract".into(), repack.into(), "-o".into(), out.into()];
+fn cli_args(inputs: &[String], out: &str, decoders: &str, mode: Mode, check: bool) -> Vec<String> {
+    let mut a: Vec<String> = vec!["extract".into()];
+    a.extend(inputs.iter().cloned());
+    a.extend(["-o".into(), out.into()]);
     if !decoders.is_empty() {
         a.extend(["--decoders".into(), decoders.into()]);
     }
@@ -176,6 +218,9 @@ enum Ask {
 
 struct App {
     repack: String,
+    /// The repack's data files, read for the folder in `parts_for`.
+    parts: Vec<Part>,
+    parts_for: String,
     out: String,
     decoders: String,
     mode: Mode,
@@ -194,6 +239,8 @@ impl App {
     fn new() -> Self {
         App {
             repack: String::new(),
+            parts: Vec::new(),
+            parts_for: String::new(),
             out: String::new(),
             decoders: String::new(),
             mode: Mode::Keep,
@@ -227,6 +274,65 @@ impl App {
         }
     }
 
+    /// Reads the repack's parts when the folder changes. ponytail: runs the
+    /// CLI on the UI thread; it reads only the indexes, which takes moments.
+    fn refresh_parts(&mut self) {
+        let dir = self.repack.trim().to_string();
+        if dir == self.parts_for {
+            return;
+        }
+        self.parts_for = dir.clone();
+        self.parts.clear();
+        if !Path::new(&dir).is_dir() {
+            return;
+        }
+        let Ok(exe) = std::env::current_exe().map(|e| e.with_file_name("unrepack.exe")) else {
+            return;
+        };
+        if let Ok(o) = Command::new(exe)
+            .args(["parts", &dir])
+            .stdin(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+        {
+            self.parts = parse_parts(&String::from_utf8_lossy(&o.stdout));
+        }
+    }
+
+    fn parts_card(&mut self, ui: &mut egui::Ui) {
+        if self.parts.iter().all(|p| p.kind == "required") {
+            return;
+        }
+        card(ui, "What to install", |ui| {
+            let base: u64 = self
+                .parts
+                .iter()
+                .filter(|p| p.kind == "required")
+                .map(|p| p.unpacked)
+                .sum();
+            ui.label(
+                RichText::new(format!(
+                    "The game itself always installs ({}).",
+                    human(base)
+                ))
+                .weak(),
+            );
+            for (kind, title) in [("language", "Languages"), ("optional", "Extras")] {
+                if !self.parts.iter().any(|p| p.kind == kind) {
+                    continue;
+                }
+                ui.label(RichText::new(title).strong());
+                ui.horizontal_wrapped(|ui| {
+                    for p in self.parts.iter_mut().filter(|p| p.kind == kind) {
+                        let stem = p.name.rsplit_once('.').map_or(p.name.as_str(), |(s, _)| s);
+                        let label = format!("{} ({})", stem.replace('_', " "), human(p.unpacked));
+                        ui.checkbox(&mut p.on, label);
+                    }
+                });
+            }
+        });
+    }
+
     fn start(&mut self, ctx: &egui::Context, check: bool) {
         if self.repack.trim().is_empty() || self.out.trim().is_empty() {
             self.outcome = Some(Outcome::Failed(
@@ -234,8 +340,9 @@ impl App {
             ));
             return;
         }
+        self.refresh_parts();
         let args = cli_args(
-            self.repack.trim(),
+            &inputs(self.repack.trim(), &self.parts),
             self.out.trim(),
             self.decoders.trim(),
             self.mode,
@@ -483,6 +590,9 @@ impl App {
                 );
             });
 
+            self.refresh_parts();
+            self.parts_card(ui);
+
             card(ui, "While unpacking", |ui| {
                 let warn = ui.visuals().warn_fg_color;
                 for (mode, title, note, risky) in [
@@ -727,13 +837,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn args_and_progress_lines() {
+    fn parts_pick_the_inputs() {
+        let mut parts = parse_parts(
+            "required\ton\t9\t90\tdata1.doi\r\nlanguage\ton\t1\t10\tEnglish.doi\n\
+             language\toff\t1\t11\tFrench.doi\noptional\ton\t2\t20\tArtwork_Mini.doi\nbad line\n",
+        );
+        assert_eq!(parts.len(), 4);
         assert_eq!(
-            cli_args("R", "O", "", Mode::Keep, false),
+            parts[2],
+            Part {
+                kind: "language".into(),
+                on: false,
+                unpacked: 11,
+                name: "French.doi".into()
+            }
+        );
+        let r = Path::new("R");
+        assert_eq!(
+            inputs("R", &parts),
+            ["data1.doi", "English.doi", "Artwork_Mini.doi"]
+                .map(|n| r.join(n).display().to_string())
+        );
+        parts[2].on = true;
+        assert_eq!(inputs("R", &parts), ["R"]);
+        assert_eq!(inputs("R", &[]), ["R"]);
+    }
+
+    #[test]
+    fn args_and_progress_lines() {
+        let r = ["R".to_string()];
+        assert_eq!(
+            cli_args(&r, "O", "", Mode::Keep, false),
             ["extract", "R", "-o", "O", "--no-verify", "--yes"]
         );
         assert_eq!(
-            cli_args("R", "O", "D", Mode::FreeAsRead, true),
+            cli_args(&["A".into(), "B".into()], "O", "", Mode::Keep, true),
+            ["extract", "A", "B", "-o", "O", "--no-verify", "--check"]
+        );
+        assert_eq!(
+            cli_args(&r, "O", "D", Mode::FreeAsRead, true),
             [
                 "extract",
                 "R",
@@ -746,7 +888,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            cli_args("R", "O", "", Mode::DeleteEach, false)[4],
+            cli_args(&r, "O", "", Mode::DeleteEach, false)[4],
             "--delete-each"
         );
         assert_eq!(

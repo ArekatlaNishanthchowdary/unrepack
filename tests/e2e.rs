@@ -429,6 +429,90 @@ fn refusals_happen_before_anything_changes() {
     );
 }
 
+/// A DODI-style folder: `parts` says what each data file is, and two
+/// language packs holding the same file extract with the later one's copy.
+#[test]
+fn language_packs_are_parts_and_the_later_copy_wins() {
+    let t = tempfile::tempdir().unwrap();
+    let pack = |name: &str, ini: &'static [u8], voice: &'static str| {
+        write_archive(
+            &t.path().join(name),
+            "storing",
+            &[
+                File {
+                    dir: "sound",
+                    name: "desktop.ini",
+                    data: ini.to_vec(),
+                },
+                File {
+                    dir: "sound",
+                    name: voice,
+                    data: vec![7; 300],
+                },
+            ],
+            false,
+        );
+    };
+    write_archive(
+        &t.path().join("data1.doi"),
+        "storing",
+        &sample_files(),
+        false,
+    );
+    pack("English.doi", b"[en]", "vm_enu.fsb");
+    pack("French.doi", b"[fr]", "vm_fra.fsb");
+    write_archive(
+        &t.path().join("Artwork.doi"),
+        "storing",
+        &[File {
+            dir: "art",
+            name: "a.png",
+            data: vec![1; 50],
+        }],
+        false,
+    );
+
+    let o = unrepack(&["parts".as_ref(), t.path().as_os_str()]);
+    ok(&o);
+    let s = String::from_utf8_lossy(&o.stdout);
+    let lines: Vec<(&str, &str, &str)> = s
+        .lines()
+        .map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            (f[0], f[1], f[4])
+        })
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            ("optional", "on", "Artwork.doi"),
+            ("language", "on", "English.doi"),
+            ("language", "off", "French.doi"),
+            ("required", "on", "data1.doi"),
+        ]
+    );
+
+    let out = t.path().join("out");
+    let o = unrepack(&[
+        "extract".as_ref(),
+        t.path().join("data1.doi").as_os_str(),
+        t.path().join("English.doi").as_os_str(),
+        t.path().join("French.doi").as_os_str(),
+        "-o".as_ref(),
+        out.as_os_str(),
+    ]);
+    ok(&o);
+    assert_extracted(&out, &sample_files());
+    assert_eq!(fs::read(out.join("sound/desktop.ini")).unwrap(), b"[fr]");
+    assert!(out.join("sound/vm_enu.fsb").is_file() && out.join("sound/vm_fra.fsb").is_file());
+    assert!(!out.join("art").exists());
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("French.doi's copy is kept"),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+}
+
 #[test]
 fn list_and_check_work_on_a_folder() {
     let t = tempfile::tempdir().unwrap();

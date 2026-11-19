@@ -26,7 +26,13 @@ unrepack 0.1: extract FreeArc repack data files without running the installer
 Usage:
   unrepack list <data file>
   unrepack extract <repack folder | data files...> -o <output folder> [options]
+  unrepack parts <repack folder>              which data files always install, and which
+                                              are languages or extras to choose from
   unrepack decoders <Setup.exe> -o <folder>   copy the decoders out of the installer
+
+A folder extracts every data file in it. To choose languages and extras as the
+installer would, name the data files you want. When two of them hold the same
+file, the one named later wins, as with the installer.
 
 Options:
   --decoders <dir>  folder with the repack's cls-*.dll, cls-*_x64.exe and cls.ini. Default:
@@ -212,6 +218,134 @@ fn data_files(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
         .collect())
 }
 
+/// What a data file is to the installer, judged by its name.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Kind {
+    /// DODI's `data<N>` and FitGirl's `fg-<N>`: always installed.
+    Required,
+    /// A language pack: `English.doi`, `fg-selective-french.bin`.
+    Language,
+    /// Anything else the installer offers: movies, artwork, soundtracks.
+    Optional,
+}
+
+/// Names repacks give their language packs, lowercase. ponytail: a fixed
+/// list; a pack it misses shows up as an extra, ticked, so nothing is lost.
+const LANGUAGES: &[&str] = &[
+    "english",
+    "french",
+    "german",
+    "italian",
+    "spanish",
+    "japanese",
+    "russian",
+    "polish",
+    "portuguese",
+    "brazilian",
+    "chinese",
+    "korean",
+    "czech",
+    "turkish",
+    "arabic",
+    "dutch",
+    "hungarian",
+    "thai",
+    "ukrainian",
+    "swedish",
+    "norwegian",
+    "danish",
+    "finnish",
+    "greek",
+    "romanian",
+    "vietnamese",
+    "indonesian",
+    "hebrew",
+    "latam",
+    "mexican",
+];
+
+/// The language a data file holds, judged by its name, if any.
+fn language(name: &str) -> Option<&'static str> {
+    let stem = Path::new(name)
+        .file_stem()?
+        .to_string_lossy()
+        .to_lowercase();
+    let rest = ["fg-selective-", "fg-optional-", "selective-", "optional-"]
+        .iter()
+        .find_map(|p| stem.strip_prefix(p))
+        .unwrap_or(&stem);
+    let first = rest.split(['-', '_', ' ', '.']).next()?;
+    LANGUAGES.iter().copied().find(|l| *l == first)
+}
+
+fn kind(name: &str) -> Kind {
+    let stem = Path::new(name)
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_lowercase();
+    let numbered = |p: &str| {
+        stem.strip_prefix(p)
+            .is_some_and(|r| !r.is_empty() && r.bytes().all(|c| c.is_ascii_digit()))
+    };
+    if numbered("data") || numbered("fg-") {
+        Kind::Required
+    } else if language(name).is_some() {
+        Kind::Language
+    } else {
+        Kind::Optional
+    }
+}
+
+/// Every data file in `dir`, what it is, and whether it starts ticked: all
+/// but the languages other than English. Errs toward extracting: with no
+/// required file recognised, all are required, and without an English
+/// pack every language starts ticked.
+fn parts(dir: &Path) -> Result<Vec<(PathBuf, Kind, bool)>> {
+    let files = data_files(&[dir.to_path_buf()])?;
+    let name = |p: &Path| {
+        p.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
+    };
+    let mut kinds: Vec<Kind> = files.iter().map(|f| kind(&name(f))).collect();
+    if !kinds.contains(&Kind::Required) {
+        kinds.fill(Kind::Required);
+    }
+    let english = |f: &Path| language(&name(f)) == Some("english");
+    let has_english = files
+        .iter()
+        .zip(&kinds)
+        .any(|(f, k)| *k == Kind::Language && english(f));
+    Ok(files
+        .into_iter()
+        .zip(kinds)
+        .map(|(f, k)| {
+            let on = k != Kind::Language || !has_english || english(&f);
+            (f, k, on)
+        })
+        .collect())
+}
+
+/// One line per data file for the app: kind, on or off, packed and unpacked
+/// bytes, name; tab-separated.
+fn parts_cmd(dir: &Path) -> Result<()> {
+    for (f, k, on) in parts(dir)? {
+        let a =
+            freearc::open(&f).with_context(|| format!("reading the index of {}", f.display()))?;
+        println!(
+            "{}\t{}\t{}\t{}\t{}",
+            format!("{k:?}").to_lowercase(),
+            if on { "on" } else { "off" },
+            a.len,
+            a.unpacked(),
+            f.file_name().unwrap_or_default().to_string_lossy()
+        );
+    }
+    Ok(())
+}
+
 fn list(path: &Path) -> Result<()> {
     let a = freearc::open(path)?;
     say!(
@@ -320,13 +454,16 @@ fn extract_cmd(a: Args) -> Result<()> {
             for e in &b.entries {
                 let key = e.path.to_string_lossy().to_lowercase();
                 if let Some(first) = seen.insert(key, f).filter(|_| !e.is_dir) {
-                    bail!(
-                        "{} is in both {} and {}. These are usually optional parts, such as \
-                         language packs, that the installer lets you choose between; name the \
-                         data files you want instead of the folder",
-                        e.path.display(),
+                    let (a, b) = (
                         first.file_name().unwrap_or_default().display(),
-                        f.file_name().unwrap_or_default().display()
+                        f.file_name().unwrap_or_default().display(),
+                    );
+                    ensure!(first != f, "{} is twice in {b}", e.path.display());
+                    // Data files extract in order, and a file's last copy is
+                    // renamed over the earlier one.
+                    note!(
+                        "{} is in both {a} and {b}; {b}'s copy is kept, as the installer would",
+                        e.path.display()
                     );
                 }
                 let t = out.join(&e.path);
@@ -496,6 +633,12 @@ fn main() -> ExitCode {
         .and_then(|a| match a.cmd.as_str() {
             "list" => a.inputs.iter().try_for_each(|p| list(p)),
             "extract" => extract_cmd(a),
+            "parts" => {
+                let [dir] = a.inputs.as_slice() else {
+                    bail!("usage: unrepack parts <repack folder>");
+                };
+                parts_cmd(dir)
+            }
             "decoders" => {
                 let (Some(setup), Some(out), 1) = (a.inputs.first(), &a.out, a.inputs.len()) else {
                     bail!("usage: unrepack decoders <Setup.exe> -o <folder>");
@@ -538,6 +681,25 @@ mod tests {
                 crc: freearc::Crc::Ieee,
             }],
         }
+    }
+
+    #[test]
+    fn parts_by_name() {
+        for (n, k) in [
+            ("data1.doi", Kind::Required),
+            ("DATA12.dodi", Kind::Required),
+            ("fg-01.bin", Kind::Required),
+            ("English.doi", Kind::Language),
+            ("Spanish_Latam.doi", Kind::Language),
+            ("fg-selective-french.bin", Kind::Language),
+            ("fg-optional-bonus.bin", Kind::Optional),
+            ("Artwork_MiniSoundtrack.doi", Kind::Optional),
+            ("opening_movie_hi.doi", Kind::Optional),
+            ("data.doi", Kind::Optional),
+        ] {
+            assert_eq!(kind(n), k, "{n}");
+        }
+        assert_eq!(language("fg-selective-english.bin"), Some("english"));
     }
 
     #[test]
