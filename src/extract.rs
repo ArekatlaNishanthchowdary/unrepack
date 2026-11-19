@@ -374,7 +374,8 @@ pub fn stages(method: &str) -> Vec<Stage> {
 }
 
 pub struct Decoders {
-    pub dir: Option<PathBuf>,
+    /// The decoders' folder, or what to do to get one.
+    pub dir: std::result::Result<PathBuf, String>,
     pub host: PathBuf,
     /// Where the decoders run: srep and lolz put temp files in `.\`.
     pub work: PathBuf,
@@ -383,9 +384,10 @@ pub struct Decoders {
 impl Decoders {
     /// A CLS plug-in wins over arc.ini, as in FreeArc.
     fn resolve(&self, name: &str, params: &str) -> Result<Decode> {
-        let dir = self.dir.as_ref().with_context(|| {
-            format!("method '{name}' needs the repack's decoders: pass --decoders <folder>")
-        })?;
+        let dir = self
+            .dir
+            .as_ref()
+            .map_err(|why| anyhow::anyhow!("method '{name}' needs the repack's decoders: {why}"))?;
         let ini = fs::read_to_string(dir.join("arc.ini")).unwrap_or_default();
         if name == "4x4" {
             // 4x4:<its options>:<inner method>[:<inner options>]
@@ -1058,7 +1060,7 @@ mod tests {
         );
 
         let dec = Decoders {
-            dir: Some(dir.path().into()),
+            dir: Ok(dir.path().into()),
             host: dir.path().join("rzw.exe"),
             work: dir.path().into(),
         };

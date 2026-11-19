@@ -7,6 +7,7 @@ mod log;
 mod builtin;
 mod extract;
 mod freearc;
+mod inno;
 mod win;
 
 use std::fs;
@@ -24,9 +25,11 @@ unrepack 0.1: extract FreeArc repack data files without running the installer
 Usage:
   unrepack list <data file>
   unrepack extract <repack folder | data files...> -o <output folder> [options]
+  unrepack decoders <Setup.exe> -o <folder>   copy the decoders out of the installer
 
 Options:
-  --decoders <dir>  folder with the repack's cls-*.dll, cls-*_x64.exe and cls.ini
+  --decoders <dir>  folder with the repack's cls-*.dll, cls-*_x64.exe and cls.ini. Default:
+                    those files next to the data files, else read out of the Setup.exe there
   --host <exe>      the 32-bit CLS host (default: unrepack-clshost.exe next to unrepack)
   --work <dir>      where decoders run and keep temp files (default: <output>\\.unrepack-work)
   --log <file>      also write every message and a progress line every 5 s to <file>
@@ -98,6 +101,78 @@ fn parse() -> Result<Args> {
         }
     }
     Ok(a)
+}
+
+/// The repack's decoders sit next to its data files only if someone put them
+/// there; most repacks keep them inside Setup.exe.
+fn has_decoders(dir: &Path) -> bool {
+    fs::read_dir(dir).is_ok_and(|rd| {
+        rd.filter_map(|e| e.ok()).any(|e| {
+            let n = e.file_name().to_string_lossy().to_lowercase();
+            n == "arc.ini" || n == "cls.ini" || (n.starts_with("cls-") && n.ends_with(".dll"))
+        })
+    })
+}
+
+/// A folder of decoders read out of Setup.exe, removed when the run ends.
+/// ponytail: a killed run leaves it in %TEMP%; sweep old ones if that piles up.
+struct Carved(PathBuf);
+
+impl Drop for Carved {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+type Found = (std::result::Result<PathBuf, String>, Option<Carved>);
+
+/// `--decoders`, else decoders next to the data files, else the ones inside
+/// the Setup.exe there. Without any, the reason goes along: methods that need
+/// them are refused later, with it.
+fn find_decoders(given: Option<&Path>, first: &Path) -> Result<Found> {
+    const HOW: &str = "keep its Setup.exe next to the data files, or pass --decoders <folder>";
+    if let Some(d) = given {
+        return Ok((Ok(std::path::absolute(d)?), None));
+    }
+    let first = std::path::absolute(first)?;
+    let Some(dir) = first.parent() else {
+        return Ok((Err(HOW.into()), None));
+    };
+    if has_decoders(dir) {
+        return Ok((Ok(dir.to_path_buf()), None));
+    }
+    let setup = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| {
+            p.file_name()
+                .is_some_and(|n| n.eq_ignore_ascii_case("setup.exe"))
+        });
+    let Some(setup) = setup else {
+        return Ok((Err(HOW.into()), None));
+    };
+    let tmp = std::env::temp_dir().join(format!("unrepack-decoders-{}", std::process::id()));
+    // A run that was killed leaves its folder; a later run with the same id
+    // must not mix that repack's decoders with this one's.
+    let _ = fs::remove_dir_all(&tmp);
+    let carved = Carved(tmp.clone());
+    match inno::carve(&setup, &tmp) {
+        Ok(n) => {
+            say!(
+                "decoders: read {n} files out of {} (nothing in it was run)",
+                setup.display()
+            );
+            Ok((Ok(tmp), Some(carved)))
+        }
+        Err(e) => Ok((
+            Err(format!(
+                "unrepack can't read them out of {}: {e:#}. Pass --decoders <folder>",
+                setup.display()
+            )),
+            None,
+        )),
+    }
 }
 
 /// Data files named directly, or every FreeArc file in a folder, by name.
@@ -221,14 +296,8 @@ fn extract_cmd(a: Args) -> Result<()> {
         None => std::env::current_exe()?.with_file_name("unrepack-clshost.exe"),
     };
     let work = a.work.clone().unwrap_or_else(|| out.join(".unrepack-work"));
-    let dec = Decoders {
-        dir: a
-            .decoders
-            .clone()
-            .map(|d| std::path::absolute(&d).unwrap_or(d)),
-        host,
-        work,
-    };
+    let (dir, _carved) = find_decoders(a.decoders.as_deref(), &files[0])?;
+    let dec = Decoders { dir, host, work };
 
     // Everything refusable is refused here, before anything changes.
     let mut seen = std::collections::HashSet::new();
@@ -409,6 +478,14 @@ fn main() -> ExitCode {
         .and_then(|a| match a.cmd.as_str() {
             "list" => a.inputs.iter().try_for_each(|p| list(p)),
             "extract" => extract_cmd(a),
+            "decoders" => {
+                let (Some(setup), Some(out), 1) = (a.inputs.first(), &a.out, a.inputs.len()) else {
+                    bail!("usage: unrepack decoders <Setup.exe> -o <folder>");
+                };
+                let n = inno::carve(setup, out)?;
+                say!("{n} files, every SHA-1 matching, in {}", out.display());
+                Ok(())
+            }
             _ => {
                 print!("{USAGE}");
                 Ok(())

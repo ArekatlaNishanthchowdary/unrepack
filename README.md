@@ -29,14 +29,14 @@ A repack's installer needs room for the repack **and** the whole game at once. C
 
 ### The app
 
-Run `unrepack-gui.exe` as administrator; the repacks' decoders don't work without it. Pick the repack folder, where to install, and the decoders folder (the folder is filled in for you when it holds the decoders). Then choose what happens to the repack and press **Check space** or **Unpack**. The app runs `unrepack.exe` next to it and shows its progress and log, so it does exactly what the command line does, with the same checks. It asks before any mode that deletes or frees the repack, and before stopping a run that would lose it.
+Run `unrepack-gui.exe` as administrator; the repacks' decoders don't work without it. Pick the repack folder and where to install; the decoders are read out of the repack's `Setup.exe`, so their folder can stay empty. Then choose what happens to the repack and press **Check space** or **Unpack**. The app runs `unrepack.exe` next to it and shows its progress and log, so it does exactly what the command line does, with the same checks. It asks before any mode that deletes or frees the repack, and before stopping a run that would lose it.
 
 Keep `unrepack-gui.exe`, `unrepack.exe` and `unrepack-clshost.exe` in the same folder.
 
 ### See whether it fits
 
 ```bash
-unrepack extract "Game [DODI Repack]" -o "D:\Games\Game" --decoders <folder> --check --free-as-read
+unrepack extract "Game [DODI Repack]" -o "D:\Games\Game" --check --free-as-read
 ```
 
 `--check` reads every data file's index and the disk's free space, and changes nothing.
@@ -44,20 +44,21 @@ unrepack extract "Game [DODI Repack]" -o "D:\Games\Game" --decoders <folder> --c
 ### Extract
 
 ```bash
-unrepack extract "Game [DODI Repack]" -o "D:\Games\Game" --decoders <folder>                  # keep the repack
-unrepack extract "Game [DODI Repack]" -o "D:\Games\Game" --decoders <folder> --delete-each    # delete each data file once it's out
-unrepack extract "Game [DODI Repack]" -o "D:\Games\Game" --decoders <folder> --free-as-read   # free the repack while reading it
-unrepack list "Game [DODI Repack]\data1.doi"                                                  # what's inside
+unrepack extract "Game [DODI Repack]" -o "D:\Games\Game"                  # keep the repack
+unrepack extract "Game [DODI Repack]" -o "D:\Games\Game" --delete-each    # delete each data file once it's out
+unrepack extract "Game [DODI Repack]" -o "D:\Games\Game" --free-as-read   # free the repack while reading it
+unrepack list "Game [DODI Repack]\data1.doi"                                # what's inside
+unrepack decoders "Game [DODI Repack]\Setup.exe" -o <folder>               # copy the decoders out
 ```
 
 The input can be a repack folder (every FreeArc data file in it is used) or one or more data files.
 
-`--decoders` is a folder holding the repack's own decoders, as its installer unpacks them: `cls-*.dll` plug-ins, their `cls-*_x64.exe` / `cls-*_x86.exe` helpers, `cls.ini`, and `arc.ini` with any external decoders it names (FitGirl's `rzw.exe`, for example). Decoders carved straight out of `Setup.exe` must have Inno Setup's CALL/JMP filter undone first.
+The repack's own decoders are needed too: `cls-*.dll` plug-ins, their `cls-*_x64.exe` / `cls-*_x86.exe` helpers, `cls.ini`, and `arc.ini` with any external decoders it names (FitGirl's `rzw.exe`, for example). unrepack reads them out of the repack's `Setup.exe` (Inno Setup 5.5, as DODI and FitGirl use) into a temporary folder, the way the installer would put them in `{tmp}`, without running anything in it. Every file is checked against the SHA-1 the installer stores, Inno's CALL/JMP filter is undone, and `{app}` / `{tmp}` in the `.ini` files become the decoders' working folder. The folder is removed when the run ends. `--decoders <folder>` uses a folder of decoders instead, and so does a repack folder that already holds them. Antivirus programs often flag a repack's `Setup.exe` (Windows Defender removed FitGirl's as `HackTool:Win32/Crack!MTB` when unrepack opened it); without it, unrepack says so and needs `--decoders`.
 
 | Option | Effect |
 |---|---|
 | `-o, --output <dir>` | Output folder |
-| `--decoders <dir>` | Folder with the repack's decoders (see above) |
+| `--decoders <dir>` | Folder with the repack's decoders, instead of reading them out of `Setup.exe` (see above) |
 | `--host <exe>` | The 32-bit CLS host. Default: `unrepack-clshost.exe` next to `unrepack.exe` |
 | `--work <dir>` | Where decoders run and keep their temp files. Default: `<output>\.unrepack-work` |
 | `--log <file>` | Also write every message, and a progress line every 5 s, to a file |
@@ -87,11 +88,11 @@ Every result below was run on real repacks. "Every CRC matching" means each file
 |---|---|---|
 | Crusader Kings III [DODI Repack], `data1.doi` | 5.74 GB solid block, `cls-lolz` + `cls-srep` | 51,467 files, 19.37 GB, every CRC matching. About 5.5 min for verify plus extract |
 | Crusader Kings III [DODI Repack], `data2.doi` | `cls-lolz` + `cls-srep` | 1,177 files, 496 MB, every CRC matching, about 10 s. Also freed as read: the repack copy was used up, and the files were identical to a run that kept it |
-| The Genesis Order [FitGirl Repack], `fg-01` | `xt2png+pref+srep+magic2` | 7,329 files, 2.13 GB, every CRC matching |
-| The Genesis Order [FitGirl Repack], `fg-02` | `mpzz+srep` | 2,992 files, 136.53 MB, every CRC matching |
-| The Genesis Order [FitGirl Repack], `fg-03`, `fg-05` | `srep+dispack070+delta+rzwb`, with built-in `dispack070` and `delta` | 14 and 3 files, 106.77 MB and 303.65 KB, every CRC matching |
-| The Genesis Order [FitGirl Repack], `fg-04` | `magic2` | 1 file, 638.62 KB, CRC matching |
-| The Genesis Order [FitGirl Repack], `fg-selective-videos-sd` | `srep+4x4:rzw` | 3,676 files, 2.65 GB, every CRC matching |
+| A FitGirl repack, `fg-01` | `xt2png+pref+srep+magic2` | 7,329 files, 2.13 GB, every CRC matching |
+| A FitGirl repack, `fg-02` | `mpzz+srep` | 2,992 files, 136.53 MB, every CRC matching |
+| A FitGirl repack, `fg-03`, `fg-05` | `srep+dispack070+delta+rzwb`, with built-in `dispack070` and `delta` | 14 and 3 files, 106.77 MB and 303.65 KB, every CRC matching |
+| A FitGirl repack, `fg-04` | `magic2` | 1 file, 638.62 KB, CRC matching |
+| A FitGirl repack, `fg-selective-videos-sd` | `srep+4x4:rzw` | 3,676 files, 2.65 GB, every CRC matching |
 
 FitGirl's own MD5 lists name 14,011 game files, and 4,210 of them match the output byte for byte. The other 9,800 are RPG Maker MV images and audio that the repack stores unencrypted, and its installer encrypts them afterwards. One file, a title movie, ships inside `Setup.exe` rather than in any data file.
 
@@ -139,7 +140,7 @@ gcc -m32 -O2 -s -static -o target/release/unrepack-clshost.exe clshost/clshost.c
 cargo test --release
 ```
 
-`cargo build --release` builds both `unrepack.exe` and the app, `unrepack-gui.exe` (egui, a single native exe). The 20 tests write FreeArc archives in the layout measured from real repacks and run the binary on them. They use `storing`, `copy`, and a CLS codec built from `clshost/test_copy.c`, so the host process runs as it does with a repack's decoders. `delta` and `dispack070` are tested on hand-built streams. `UNREPACK_SAMPLE=<data file> cargo test real_sample` also parses a real data file, and `UNREPACK_DUMP=<dir>` saves every stage's output for debugging.
+`cargo build --release` builds both `unrepack.exe` and the app, `unrepack-gui.exe` (egui, a single native exe). The 25 tests write FreeArc archives in the layout measured from real repacks and run the binary on them. They use `storing`, `copy`, and a CLS codec built from `clshost/test_copy.c`, so the host process runs as it does with a repack's decoders. `delta` and `dispack070` are tested on hand-built streams. `UNREPACK_SAMPLE=<data file> cargo test real_sample` also parses a real data file, and `UNREPACK_DUMP=<dir>` saves every stage's output for debugging.
 
 ## License
 

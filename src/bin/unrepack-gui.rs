@@ -66,17 +66,6 @@ fn human(b: u64) -> String {
     }
 }
 
-/// The repack's decoders sit next to its data files only if someone put them
-/// there; most repacks keep them inside Setup.exe.
-fn has_decoders(dir: &Path) -> bool {
-    std::fs::read_dir(dir).is_ok_and(|rd| {
-        rd.filter_map(|e| e.ok()).any(|e| {
-            let n = e.file_name().to_string_lossy().to_lowercase();
-            n == "arc.ini" || n == "cls.ini" || (n.starts_with("cls-") && n.ends_with(".dll"))
-        })
-    })
-}
-
 const OK_GREEN: Color32 = Color32::from_rgb(60, 170, 90);
 
 /// Roomier spacing, rounder corners and slightly larger text than egui's defaults.
@@ -221,9 +210,6 @@ impl App {
 
     fn picked_repack(&mut self, dir: &Path) {
         self.repack = dir.display().to_string();
-        if has_decoders(dir) {
-            self.decoders = self.repack.clone();
-        }
         if self.out.is_empty() {
             // "Game [DODI Repack]" -> "Game", next to the repack: the same
             // drive, so freeing the repack helps.
@@ -429,7 +415,7 @@ impl App {
         value: &mut String,
     ) -> Option<std::path::PathBuf> {
         ui.horizontal(|ui| {
-            ui.add_sized([120.0, 24.0], egui::Label::new(label));
+            ui.add_sized([132.0, 24.0], egui::Label::new(label));
             ui.add(
                 egui::TextEdit::singleline(value)
                     // Room for the Browse button and the gap before it.
@@ -484,13 +470,13 @@ impl App {
                 if let Some(d) = Self::folder_row(ui, "Install to", &mut self.out) {
                     self.out = d.display().to_string();
                 }
-                if let Some(d) = Self::folder_row(ui, "Decoders folder", &mut self.decoders) {
+                if let Some(d) = Self::folder_row(ui, "Decoders (optional)", &mut self.decoders) {
                     self.decoders = d.display().to_string();
                 }
                 ui.label(
                     RichText::new(
-                        "Decoders are the repack's own cls-*.dll, cls.ini and arc.ini files. Most repacks keep them \
-                         inside Setup.exe; unrepack can't take them out of it yet, so they must be in a folder.",
+                        "Leave Decoders empty: unrepack reads the repack's decoders (cls-*.dll, cls.ini, arc.ini) out of \
+                         its Setup.exe without running it. Fill it in only to use a folder of decoders instead.",
                     )
                     .small()
                     .weak(),
