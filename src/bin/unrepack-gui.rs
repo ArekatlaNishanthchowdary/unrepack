@@ -24,9 +24,51 @@ enum Mode {
     FreeAsRead,
 }
 
+/// One data file, as `unrepack parts` describes it.
+#[derive(Clone, PartialEq, Debug)]
+struct Part {
+    kind: String,
+    on: bool,
+    unpacked: u64,
+    name: String,
+}
+
+/// `unrepack parts` output: kind, on/off, packed, unpacked, name per line.
+fn parse_parts(text: &str) -> Vec<Part> {
+    text.lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.trim_end_matches('\r').splitn(5, '\t').collect();
+            let [kind, on, _, unpacked, name] = f.as_slice() else {
+                return None;
+            };
+            Some(Part {
+                kind: kind.to_string(),
+                on: *on == "on",
+                unpacked: unpacked.parse().ok()?,
+                name: name.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// What to extract: the folder when every part is ticked (or none are
+/// known), else the ticked data files by name.
+fn inputs(repack: &str, parts: &[Part]) -> Vec<String> {
+    if parts.iter().all(|p| p.on) {
+        return vec![repack.into()];
+    }
+    parts
+        .iter()
+        .filter(|p| p.on)
+        .map(|p| Path::new(repack).join(&p.name).display().to_string())
+        .collect()
+}
+
 /// The CLI's arguments for one run. `--yes` because the window asks instead.
-fn cli_args(repack: &str, out: &str, decoders: &str, mode: Mode, check: bool) -> Vec<String> {
-    let mut a: Vec<String> = vec!["extract".into(), repack.into(), "-o".into(), out.into()];
+fn cli_args(inputs: &[String], out: &str, decoders: &str, mode: Mode, check: bool) -> Vec<String> {
+    let mut a: Vec<String> = vec!["extract".into()];
+    a.extend(inputs.iter().cloned());
+    a.extend(["-o".into(), out.into()]);
     if !decoders.is_empty() {
         a.extend(["--decoders".into(), decoders.into()]);
     }
@@ -129,9 +171,74 @@ fn is_admin() -> bool {
     unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() != 0 }
 }
 
-fn restart_as_admin() -> bool {
+fn wide(s: &std::ffi::OsStr) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
-    let wide = |s: &std::ffi::OsStr| s.encode_wide().chain([0]).collect::<Vec<u16>>();
+    s.encode_wide().chain([0]).collect()
+}
+
+/// The PowerShell that has Defender skip unrepack's programs (`dir` holds
+/// them) and the repack folder.
+fn defender_command(dir: &Path, repack: &Path) -> String {
+    let q = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', "''"));
+    let exes = ["unrepack-gui.exe", "unrepack.exe", "unrepack-clshost.exe"]
+        .map(|e| q(&dir.join(e)))
+        .join(",");
+    format!(
+        "$ErrorActionPreference='Stop'; Add-MpPreference -ExclusionProcess {exes} -ExclusionPath {}",
+        q(repack)
+    )
+}
+
+/// Adds the Defender exclusions through an administrator prompt. Ok(false):
+/// the user said no to the prompt. ponytail: waits on the UI thread; the
+/// prompt is modal anyway and PowerShell takes a second or two after it.
+fn defender_exclude(repack: &Path) -> Result<bool, String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_CANCELLED};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, INFINITE, WaitForSingleObject,
+    };
+    use windows_sys::Win32::UI::Shell::{
+        SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
+    };
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let cmd = defender_command(exe.parent().unwrap_or(Path::new(".")), repack);
+    let params = format!("-NoProfile -NonInteractive -WindowStyle Hidden -Command \"{cmd}\"");
+    let (verb, file, params) = (
+        wide("runas".as_ref()),
+        wide("powershell.exe".as_ref()),
+        wide(params.as_ref()),
+    );
+    let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+    info.cbSize = size_of::<SHELLEXECUTEINFOW>() as u32;
+    info.fMask = SEE_MASK_NOCLOSEPROCESS;
+    info.lpVerb = verb.as_ptr();
+    info.lpFile = file.as_ptr();
+    info.lpParameters = params.as_ptr();
+    info.nShow = 0; // SW_HIDE
+    if unsafe { ShellExecuteExW(&mut info) } == 0 {
+        let e = std::io::Error::last_os_error();
+        return match e.raw_os_error() {
+            Some(c) if c as u32 == ERROR_CANCELLED => Ok(false),
+            _ => Err(e.to_string()),
+        };
+    }
+    let mut code = 1u32;
+    unsafe {
+        WaitForSingleObject(info.hProcess, INFINITE);
+        GetExitCodeProcess(info.hProcess, &mut code);
+        CloseHandle(info.hProcess);
+    }
+    if code == 0 {
+        Ok(true)
+    } else {
+        Err(format!(
+            "Windows Defender didn't take the exclusion (PowerShell exited with {code}). \
+             Another antivirus may be in charge, or your organisation manages Defender."
+        ))
+    }
+}
+
+fn restart_as_admin() -> bool {
     let Ok(exe) = std::env::current_exe() else {
         return false;
     };
@@ -172,10 +279,14 @@ enum Ask {
     Extract,
     Stop,
     Close,
+    Defender,
 }
 
 struct App {
     repack: String,
+    /// The repack's data files, read for the folder in `parts_for`.
+    parts: Vec<Part>,
+    parts_for: String,
     out: String,
     decoders: String,
     mode: Mode,
@@ -194,6 +305,8 @@ impl App {
     fn new() -> Self {
         App {
             repack: String::new(),
+            parts: Vec::new(),
+            parts_for: String::new(),
             out: String::new(),
             decoders: String::new(),
             mode: Mode::Keep,
@@ -227,6 +340,65 @@ impl App {
         }
     }
 
+    /// Reads the repack's parts when the folder changes. ponytail: runs the
+    /// CLI on the UI thread; it reads only the indexes, which takes moments.
+    fn refresh_parts(&mut self) {
+        let dir = self.repack.trim().to_string();
+        if dir == self.parts_for {
+            return;
+        }
+        self.parts_for = dir.clone();
+        self.parts.clear();
+        if !Path::new(&dir).is_dir() {
+            return;
+        }
+        let Ok(exe) = std::env::current_exe().map(|e| e.with_file_name("unrepack.exe")) else {
+            return;
+        };
+        if let Ok(o) = Command::new(exe)
+            .args(["parts", &dir])
+            .stdin(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+        {
+            self.parts = parse_parts(&String::from_utf8_lossy(&o.stdout));
+        }
+    }
+
+    fn parts_card(&mut self, ui: &mut egui::Ui) {
+        if self.parts.iter().all(|p| p.kind == "required") {
+            return;
+        }
+        card(ui, "What to install", |ui| {
+            let base: u64 = self
+                .parts
+                .iter()
+                .filter(|p| p.kind == "required")
+                .map(|p| p.unpacked)
+                .sum();
+            ui.label(
+                RichText::new(format!(
+                    "The game itself always installs ({}).",
+                    human(base)
+                ))
+                .weak(),
+            );
+            for (kind, title) in [("language", "Languages"), ("optional", "Extras")] {
+                if !self.parts.iter().any(|p| p.kind == kind) {
+                    continue;
+                }
+                ui.label(RichText::new(title).strong());
+                ui.horizontal_wrapped(|ui| {
+                    for p in self.parts.iter_mut().filter(|p| p.kind == kind) {
+                        let stem = p.name.rsplit_once('.').map_or(p.name.as_str(), |(s, _)| s);
+                        let label = format!("{} ({})", stem.replace('_', " "), human(p.unpacked));
+                        ui.checkbox(&mut p.on, label);
+                    }
+                });
+            }
+        });
+    }
+
     fn start(&mut self, ctx: &egui::Context, check: bool) {
         if self.repack.trim().is_empty() || self.out.trim().is_empty() {
             self.outcome = Some(Outcome::Failed(
@@ -234,8 +406,9 @@ impl App {
             ));
             return;
         }
+        self.refresh_parts();
         let args = cli_args(
-            self.repack.trim(),
+            &inputs(self.repack.trim(), &self.parts),
             self.out.trim(),
             self.decoders.trim(),
             self.mode,
@@ -483,6 +656,9 @@ impl App {
                 );
             });
 
+            self.refresh_parts();
+            self.parts_card(ui);
+
             card(ui, "While unpacking", |ui| {
                 let warn = ui.visuals().warn_fg_color;
                 for (mode, title, note, risky) in [
@@ -541,6 +717,16 @@ impl App {
                 let _ = Command::new("explorer").arg(&self.out).spawn();
             }
         });
+        if ui
+            .add_enabled(
+                !running && Path::new(self.repack.trim()).is_dir(),
+                egui::Button::new("🛡 Let Windows Defender skip this repack…").small(),
+            )
+            .on_hover_text("Defender often removes repack decoders and Setup.exe mid-unpack.")
+            .clicked()
+        {
+            self.ask = Some(Ask::Defender);
+        }
         ui.label(
             RichText::new(
                 "unrepack runs the decoders that came with the download. Use repacks you trust.",
@@ -610,16 +796,29 @@ impl App {
 
     fn dialogs(&mut self, ctx: &egui::Context) {
         let Some(ask) = self.ask else { return };
-        if ask != Ask::Extract && self.run.is_none() {
+        if matches!(ask, Ask::Stop | Ask::Close) && self.run.is_none() {
             // The run ended while the question was open.
             self.ask = None;
             return;
         }
         let destroys = self.stop_destroys();
         let mut answer = None;
+        let defender = format!(
+            "Windows Defender often flags a repack's decoders and Setup.exe and removes them while \
+             unpacking. This adds Defender exclusions for unrepack's own programs and for this folder:\n\n\
+             {}\n\nDefender then won't scan anything in that folder, so do this only for a repack you \
+             trust. Windows asks for administrator permission next. To undo it: Windows Security > \
+             Virus & threat protection > Manage settings > Exclusions.",
+            self.repack.trim()
+        );
         egui::Modal::new(egui::Id::unique("ask")).show(ctx, |ui| {
             ui.set_max_width(440.0);
             let (title, text, yes) = match ask {
+                Ask::Defender => (
+                    "Let Windows Defender skip this repack?",
+                    defender.as_str(),
+                    "Add exclusion",
+                ),
                 Ask::Extract if self.mode == Mode::FreeAsRead => (
                     "Free the repack while reading it?",
                     "This frees the repack's bytes as they are read. If the run stops for any reason after \
@@ -660,7 +859,8 @@ impl App {
                 if ui.add(b).clicked() {
                     answer = Some(true);
                 }
-                if ui.button(if ask == Ask::Extract { "Cancel" } else { "Keep going" }).clicked() {
+                let no = if matches!(ask, Ask::Stop | Ask::Close) { "Keep going" } else { "Cancel" };
+                if ui.button(no).clicked() {
                     answer = Some(false);
                 }
             });
@@ -670,6 +870,18 @@ impl App {
                 self.ask = None;
                 match ask {
                     Ask::Extract => self.start(ctx, false),
+                    Ask::Defender => {
+                        self.outcome = Some(match defender_exclude(Path::new(self.repack.trim())) {
+                            Ok(true) => Outcome::Ok(
+                                "Windows Defender now skips unrepack and this repack folder."
+                                    .into(),
+                            ),
+                            Ok(false) => Outcome::Stopped(
+                                "No exclusion added: the administrator prompt was declined.".into(),
+                            ),
+                            Err(e) => Outcome::Failed(e),
+                        })
+                    }
                     Ask::Stop => self.stop(),
                     Ask::Close => {
                         self.stop();
@@ -727,13 +939,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn args_and_progress_lines() {
+    fn parts_pick_the_inputs() {
+        let mut parts = parse_parts(
+            "required\ton\t9\t90\tdata1.doi\r\nlanguage\ton\t1\t10\tEnglish.doi\n\
+             language\toff\t1\t11\tFrench.doi\noptional\ton\t2\t20\tArtwork_Mini.doi\nbad line\n",
+        );
+        assert_eq!(parts.len(), 4);
         assert_eq!(
-            cli_args("R", "O", "", Mode::Keep, false),
+            parts[2],
+            Part {
+                kind: "language".into(),
+                on: false,
+                unpacked: 11,
+                name: "French.doi".into()
+            }
+        );
+        let r = Path::new("R");
+        assert_eq!(
+            inputs("R", &parts),
+            ["data1.doi", "English.doi", "Artwork_Mini.doi"]
+                .map(|n| r.join(n).display().to_string())
+        );
+        parts[2].on = true;
+        assert_eq!(inputs("R", &parts), ["R"]);
+        assert_eq!(inputs("R", &[]), ["R"]);
+    }
+
+    #[test]
+    fn args_and_progress_lines() {
+        let r = ["R".to_string()];
+        assert_eq!(
+            cli_args(&r, "O", "", Mode::Keep, false),
             ["extract", "R", "-o", "O", "--no-verify", "--yes"]
         );
         assert_eq!(
-            cli_args("R", "O", "D", Mode::FreeAsRead, true),
+            cli_args(&["A".into(), "B".into()], "O", "", Mode::Keep, true),
+            ["extract", "A", "B", "-o", "O", "--no-verify", "--check"]
+        );
+        assert_eq!(
+            cli_args(&r, "O", "D", Mode::FreeAsRead, true),
             [
                 "extract",
                 "R",
@@ -746,7 +990,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            cli_args("R", "O", "", Mode::DeleteEach, false)[4],
+            cli_args(&r, "O", "", Mode::DeleteEach, false)[4],
             "--delete-each"
         );
         assert_eq!(
@@ -755,5 +999,18 @@ mod tests {
         );
         assert_eq!(parse_progress("rzw: 42% done"), None);
         assert_eq!(parse_progress("@progress extracting x 10"), None);
+    }
+
+    #[test]
+    fn defender_command_quotes_paths() {
+        let c = defender_command(
+            Path::new(r"C:\u"),
+            Path::new(r"D:\Bob's Game [DODI Repack]"),
+        );
+        assert!(c.starts_with("$ErrorActionPreference='Stop'; Add-MpPreference -ExclusionProcess 'C:\\u\\unrepack-gui.exe','C:\\u\\unrepack.exe','C:\\u\\unrepack-clshost.exe' "), "{c}");
+        assert!(
+            c.ends_with(r" -ExclusionPath 'D:\Bob''s Game [DODI Repack]'"),
+            "{c}"
+        );
     }
 }

@@ -1,6 +1,6 @@
 # Test data
 
-Streams for the `tor` and `lzma` tests, made from synthetic data by real encoders. The tests hold only the length and CRC-32 of the original data.
+Streams for the `tor`, `lzma` and `4x4` tests, made from synthetic data by real encoders. The tests hold only the length and CRC-32 of the original data.
 
 ## tor-*.bin
 
@@ -22,3 +22,12 @@ Made by `tor.exe` built from the FreeArc 0.67 source (`Compression/Tornado/main.
 ## lzma-*.bin
 
 Raw LZMA1 with an end marker, as FreeArc's `lzma` writes, made by Python's `lzma` module (liblzma) from `small.bin` with a 1 MB dictionary: `lzma-default.bin` with lc3 lp0 pb2, and `lzma-lc1lp2pb0.bin` with lc1 lp2 pb0. lc8, which liblzma can't write, is tested with lzma-rust2's own encoder.
+
+## 4x4-*.bin
+
+The `4x4` stream of the one block in an archive made by FreeArc 0.67's `Arc.exe` (`a -mt1 -i0`), cut out at the block's offset. The input, `mixed.bin`, is `small.bin` followed by 64 KB of SHA-256 output (the digests of `i` as 4 little-endian bytes, `i` from 0 to 2047): 189,152 bytes, CRC-32 9815b9f8. Each stream has 6 frames, and the 2 frames of SHA-256 output are stored, since 4x4 doesn't compress data that looks random.
+
+| File | Arc.exe method | Method in the archive |
+|---|---|---|
+| `4x4-tor.bin` | `-m=4x4:b32kb:tor:3` | `4x4:b32kb:tor:3:188kb` |
+| `4x4-lzma.bin` | `-m=4x4:b32kb:lzma:1mb:fast` | `4x4:b32kb:lzma:188kb:fast:32` |
