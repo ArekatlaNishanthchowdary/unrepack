@@ -164,6 +164,4 @@ unrepack is licensed under either of [Apache License, Version 2.0](LICENSE-APACH
 
 `src/builtin.rs` holds the ports of FreeArc's `delta` and `dispack070` decoders, and `src/tornado.rs` the port of its `tor` decoder. Both stay under the terms of the FreeArc source they come from ([LICENSE-FREEARC](LICENSE-FREEARC)). The `delta` decoder is free to use only for decompressing FreeArc archives, and it is not open source. `dispack070` and `tor` come from FreeArc's GPL-2.0 tree. Without those two files, unrepack is open source throughout, but it can't decode repacks that use those three methods.
 
-Parts of `src/win.rs` are adapted from [HatchZip](https://github.com/xevrion/hatchzip) under its MIT license. That copyright notice is kept in [LICENSE-MIT](LICENSE-MIT).
-
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in unrepack by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
