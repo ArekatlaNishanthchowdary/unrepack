@@ -171,9 +171,74 @@ fn is_admin() -> bool {
     unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() != 0 }
 }
 
-fn restart_as_admin() -> bool {
+fn wide(s: &std::ffi::OsStr) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
-    let wide = |s: &std::ffi::OsStr| s.encode_wide().chain([0]).collect::<Vec<u16>>();
+    s.encode_wide().chain([0]).collect()
+}
+
+/// The PowerShell that has Defender skip unrepack's programs (`dir` holds
+/// them) and the repack folder.
+fn defender_command(dir: &Path, repack: &Path) -> String {
+    let q = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', "''"));
+    let exes = ["unrepack-gui.exe", "unrepack.exe", "unrepack-clshost.exe"]
+        .map(|e| q(&dir.join(e)))
+        .join(",");
+    format!(
+        "$ErrorActionPreference='Stop'; Add-MpPreference -ExclusionProcess {exes} -ExclusionPath {}",
+        q(repack)
+    )
+}
+
+/// Adds the Defender exclusions through an administrator prompt. Ok(false):
+/// the user said no to the prompt. ponytail: waits on the UI thread; the
+/// prompt is modal anyway and PowerShell takes a second or two after it.
+fn defender_exclude(repack: &Path) -> Result<bool, String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_CANCELLED};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, INFINITE, WaitForSingleObject,
+    };
+    use windows_sys::Win32::UI::Shell::{
+        SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
+    };
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let cmd = defender_command(exe.parent().unwrap_or(Path::new(".")), repack);
+    let params = format!("-NoProfile -NonInteractive -WindowStyle Hidden -Command \"{cmd}\"");
+    let (verb, file, params) = (
+        wide("runas".as_ref()),
+        wide("powershell.exe".as_ref()),
+        wide(params.as_ref()),
+    );
+    let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+    info.cbSize = size_of::<SHELLEXECUTEINFOW>() as u32;
+    info.fMask = SEE_MASK_NOCLOSEPROCESS;
+    info.lpVerb = verb.as_ptr();
+    info.lpFile = file.as_ptr();
+    info.lpParameters = params.as_ptr();
+    info.nShow = 0; // SW_HIDE
+    if unsafe { ShellExecuteExW(&mut info) } == 0 {
+        let e = std::io::Error::last_os_error();
+        return match e.raw_os_error() {
+            Some(c) if c as u32 == ERROR_CANCELLED => Ok(false),
+            _ => Err(e.to_string()),
+        };
+    }
+    let mut code = 1u32;
+    unsafe {
+        WaitForSingleObject(info.hProcess, INFINITE);
+        GetExitCodeProcess(info.hProcess, &mut code);
+        CloseHandle(info.hProcess);
+    }
+    if code == 0 {
+        Ok(true)
+    } else {
+        Err(format!(
+            "Windows Defender didn't take the exclusion (PowerShell exited with {code}). \
+             Another antivirus may be in charge, or your organisation manages Defender."
+        ))
+    }
+}
+
+fn restart_as_admin() -> bool {
     let Ok(exe) = std::env::current_exe() else {
         return false;
     };
@@ -214,6 +279,7 @@ enum Ask {
     Extract,
     Stop,
     Close,
+    Defender,
 }
 
 struct App {
@@ -651,6 +717,16 @@ impl App {
                 let _ = Command::new("explorer").arg(&self.out).spawn();
             }
         });
+        if ui
+            .add_enabled(
+                !running && Path::new(self.repack.trim()).is_dir(),
+                egui::Button::new("🛡 Let Windows Defender skip this repack…").small(),
+            )
+            .on_hover_text("Defender often removes repack decoders and Setup.exe mid-unpack.")
+            .clicked()
+        {
+            self.ask = Some(Ask::Defender);
+        }
         ui.label(
             RichText::new(
                 "unrepack runs the decoders that came with the download. Use repacks you trust.",
@@ -720,16 +796,29 @@ impl App {
 
     fn dialogs(&mut self, ctx: &egui::Context) {
         let Some(ask) = self.ask else { return };
-        if ask != Ask::Extract && self.run.is_none() {
+        if matches!(ask, Ask::Stop | Ask::Close) && self.run.is_none() {
             // The run ended while the question was open.
             self.ask = None;
             return;
         }
         let destroys = self.stop_destroys();
         let mut answer = None;
+        let defender = format!(
+            "Windows Defender often flags a repack's decoders and Setup.exe and removes them while \
+             unpacking. This adds Defender exclusions for unrepack's own programs and for this folder:\n\n\
+             {}\n\nDefender then won't scan anything in that folder, so do this only for a repack you \
+             trust. Windows asks for administrator permission next. To undo it: Windows Security > \
+             Virus & threat protection > Manage settings > Exclusions.",
+            self.repack.trim()
+        );
         egui::Modal::new(egui::Id::unique("ask")).show(ctx, |ui| {
             ui.set_max_width(440.0);
             let (title, text, yes) = match ask {
+                Ask::Defender => (
+                    "Let Windows Defender skip this repack?",
+                    defender.as_str(),
+                    "Add exclusion",
+                ),
                 Ask::Extract if self.mode == Mode::FreeAsRead => (
                     "Free the repack while reading it?",
                     "This frees the repack's bytes as they are read. If the run stops for any reason after \
@@ -770,7 +859,8 @@ impl App {
                 if ui.add(b).clicked() {
                     answer = Some(true);
                 }
-                if ui.button(if ask == Ask::Extract { "Cancel" } else { "Keep going" }).clicked() {
+                let no = if matches!(ask, Ask::Stop | Ask::Close) { "Keep going" } else { "Cancel" };
+                if ui.button(no).clicked() {
                     answer = Some(false);
                 }
             });
@@ -780,6 +870,18 @@ impl App {
                 self.ask = None;
                 match ask {
                     Ask::Extract => self.start(ctx, false),
+                    Ask::Defender => {
+                        self.outcome = Some(match defender_exclude(Path::new(self.repack.trim())) {
+                            Ok(true) => Outcome::Ok(
+                                "Windows Defender now skips unrepack and this repack folder."
+                                    .into(),
+                            ),
+                            Ok(false) => Outcome::Stopped(
+                                "No exclusion added: the administrator prompt was declined.".into(),
+                            ),
+                            Err(e) => Outcome::Failed(e),
+                        })
+                    }
                     Ask::Stop => self.stop(),
                     Ask::Close => {
                         self.stop();
@@ -897,5 +999,18 @@ mod tests {
         );
         assert_eq!(parse_progress("rzw: 42% done"), None);
         assert_eq!(parse_progress("@progress extracting x 10"), None);
+    }
+
+    #[test]
+    fn defender_command_quotes_paths() {
+        let c = defender_command(
+            Path::new(r"C:\u"),
+            Path::new(r"D:\Bob's Game [DODI Repack]"),
+        );
+        assert!(c.starts_with("$ErrorActionPreference='Stop'; Add-MpPreference -ExclusionProcess 'C:\\u\\unrepack-gui.exe','C:\\u\\unrepack.exe','C:\\u\\unrepack-clshost.exe' "), "{c}");
+        assert!(
+            c.ends_with(r" -ExclusionPath 'D:\Bob''s Game [DODI Repack]'"),
+            "{c}"
+        );
     }
 }
