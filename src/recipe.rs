@@ -30,10 +30,13 @@ pub enum Step {
         component: Option<String>,
     },
     /// ISExec: a program, its parameters and the folder it runs in.
+    /// `makes`: what Setup shows while it runs, which for FitGirl's rebuild
+    /// steps is the game file they make (`archive\pc\...\x.archive`).
     Run {
         exe: String,
         params: String,
         dir: String,
+        makes: String,
     },
     DelTree(String),
     DeleteFile(String),
@@ -132,6 +135,7 @@ pub fn steps(calls: &[Call]) -> Result<Vec<Step>> {
                     exe: text(c, 3)?.to_string(),
                     params: text(c, 4)?.to_string(),
                     dir: text(c, 5)?.to_string(),
+                    makes: text(c, 6).unwrap_or_default().to_string(),
                 });
             }
             "SETINISTRING" => {
@@ -154,6 +158,16 @@ pub fn steps(calls: &[Call]) -> Result<Vec<Step>> {
         }
     }
     Ok(out)
+}
+
+/// The game file a rebuild step makes, if its label names one: a relative
+/// path, no spaces ("Preparing installation..." isn't one).
+pub fn product(makes: &str) -> Option<&str> {
+    (makes.contains('\\')
+        && !makes.contains([' ', ':'])
+        && !makes.starts_with('\\')
+        && !makes.split('\\').any(|p| p == ".." || p.is_empty()))
+    .then_some(makes)
 }
 
 /// Whether following the script matters: it unpacks helper tools for later
@@ -348,5 +362,13 @@ mod tests {
         let mut c = call("ISExec", &["", "", "", "{cmd}", "", "", "", ""]);
         c.args[4] = Val::Unknown;
         assert!(steps(&[c]).is_err());
+    }
+
+    #[test]
+    fn product_takes_only_a_plain_relative_path() {
+        assert_eq!(product(r"archive\pc\ep1\x.archive"), Some(r"archive\pc\ep1\x.archive"));
+        for bad in ["Preparing installation...", "...", "", r"\x\y", r"C:\x\y", r"a\..\..\y", r"a\\y"] {
+            assert_eq!(product(bad), None, "{bad}");
+        }
     }
 }

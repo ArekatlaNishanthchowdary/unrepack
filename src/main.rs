@@ -265,6 +265,25 @@ fn run_setup_cmd(exe: &str, params: &str, dir: &str, places: &recipe::Places) ->
     Ok(())
 }
 
+/// Whether a component of Setup's (`local\eng`) belongs to a data file being
+/// unpacked.
+fn chosen_component(steps: &[recipe::Step], jobs: &[(PathBuf, freearc::Archive)], c: &str) -> bool {
+    steps.iter().any(|s| match s {
+        recipe::Step::Extract {
+            data,
+            component: Some(x),
+            ..
+        } => {
+            x.eq_ignore_ascii_case(c)
+                && jobs.iter().any(|(f, _)| {
+                    f.file_name()
+                        .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(data))
+                })
+        }
+        _ => false,
+    })
+}
+
 /// Does one of Setup's steps. Settings changes were made up front; a data
 /// file not chosen for this run is passed over, as Setup does an unticked one.
 fn setup_step(
@@ -317,7 +336,7 @@ fn setup_step(
                 )?;
             }
         }
-        recipe::Step::Run { exe, params, dir } => run_setup_cmd(exe, params, dir, pl)?,
+        recipe::Step::Run { exe, params, dir, .. } => run_setup_cmd(exe, params, dir, pl)?,
         recipe::Step::DelTree(d) => {
             let d = pl.inside(d)?;
             if d.is_dir() {
@@ -921,6 +940,17 @@ fn extract_cmd(a: Args) -> Result<()> {
             }
         }
     }
+    if let (Some(steps), Some(setup)) = (&steps, setup_in(&src_dir)) {
+        let own = inno::carve_app(&setup, None, &|c| chosen_component(steps, &jobs, c))?;
+        for n in &own {
+            ensure!(
+                !seen.contains_key(&n.to_lowercase()),
+                "Setup.exe puts {n} in the game folder, and a data file has it too; \
+                 unrepack can't tell which is meant"
+            );
+        }
+        say!("Setup.exe puts these in the game folder itself: {}", own.join(", "));
+    }
     let out_volume = win::volume(&out)?;
     let same_volume = jobs
         .iter()
@@ -1077,27 +1107,32 @@ fn extract_cmd(a: Args) -> Result<()> {
     if let (Some(steps), Some(pl)) = (&steps, &places) {
         // What Setup installs into the game folder itself: FitGirl's hash
         // lists, one per component, which its last step joins up.
-        let chosen: Vec<&str> = steps
-            .iter()
-            .filter_map(|s| match s {
-                recipe::Step::Extract {
-                    data,
-                    component: Some(c),
-                    ..
-                } if jobs.iter().any(|(f, _)| lname(f) == data.to_lowercase()) => Some(c.as_str()),
-                _ => None,
-            })
-            .collect();
         if let Some(setup) = setup_in(&src_dir) {
-            let n = inno::carve_app(&setup, &out, &|c| {
-                chosen.iter().any(|x| x.eq_ignore_ascii_case(c))
-            })?;
-            say!("copied {n} file(s) Setup.exe puts in the game folder itself");
+            let n = inno::carve_app(&setup, Some(&out), &|c| chosen_component(steps, &jobs, c))?;
+            say!(
+                "copied {} file(s) Setup.exe puts in the game folder itself",
+                n.len()
+            );
         }
         for s in &steps[first..] {
             if !matches!(s, recipe::Step::Extract { tools: true, .. }) {
                 setup_step(s, pl, &tools, &jobs, &dec, &mut p)
                     .inspect_err(|_| carved.iter().for_each(Carved::keep))?;
+            }
+        }
+        // A rebuild step that exits 0 without making its file would leave
+        // the game folder short; Setup names the file it makes.
+        for s in &steps[first..] {
+            if let recipe::Step::Run { makes, .. } = s {
+                if let Some(f) = recipe::product(makes) {
+                    let path = pl.app.join(f);
+                    ensure!(
+                        path.is_file(),
+                        "Setup's step should have made {}, but it isn't there; \
+                         the game folder is incomplete",
+                        path.display()
+                    );
+                }
             }
         }
         let _ = fs::remove_dir(&dec.work);
@@ -1202,11 +1237,10 @@ mod tests {
                 "fg-01.bin"
             ]
         );
-        assert!(steps.contains(&recipe::Step::Run {
-            exe: r"{tmp}\work\build01.bat".into(),
-            params: String::new(),
-            dir: r"{app}\archive\pc\content\audio_2_soundbanks\".into(),
-        }));
+        assert!(steps.iter().any(|s| matches!(s, recipe::Step::Run { exe, params, dir, .. }
+            if exe == r"{tmp}\work\build01.bat"
+                && params.is_empty()
+                && dir == r"{app}\archive\pc\content\audio_2_soundbanks\")));
     }
 
     #[test]

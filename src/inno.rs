@@ -286,24 +286,28 @@ pub fn script(setup: &Path) -> Result<Option<Vec<u8>>> {
 /// Writes the files the installer would put in `{tmp}` (its decoders among
 /// them) into `out`, each checked against its SHA-1. Returns how many.
 pub fn carve(setup: &Path, out: &Path) -> Result<usize> {
-    let n = carve_place(setup, "{tmp}", out, &|_| true)?;
+    let n = carve_place(setup, "{tmp}", Some(out), &|_| true)?.len();
     ensure!(n > 0, "Setup.exe puts no files in {{tmp}}");
     Ok(n)
 }
 
 /// The files the installer itself puts in the game folder, for the
 /// components `keep` accepts (FitGirl's `_Redist\fitgirl.md5` and a hash list
-/// per language). Returns how many.
-pub fn carve_app(setup: &Path, out: &Path, keep: &dyn Fn(&str) -> bool) -> Result<usize> {
+/// per language), written into `out` or, without it, only named.
+pub fn carve_app(
+    setup: &Path,
+    out: Option<&Path>,
+    keep: &dyn Fn(&str) -> bool,
+) -> Result<Vec<String>> {
     carve_place(setup, "{app}", out, &|c| c.is_empty() || keep(c))
 }
 
 fn carve_place(
     setup: &Path,
     place: &str,
-    out: &Path,
+    out: Option<&Path>,
     keep: &dyn Fn(&str) -> bool,
-) -> Result<usize> {
+) -> Result<Vec<String>> {
     let data = fs::read(setup).with_context(|| format!("reading {}", setup.display()))?;
     let Some(id) = data.windows(ID.len()).rposition(|w| w == ID) else {
         bail!("not an Inno Setup 5.5 installer, the only kind unrepack can read the decoders from");
@@ -316,10 +320,21 @@ fn carve_place(
         "Setup.exe's file table isn't the Inno Setup 5.5 kind"
     );
     let recs: Vec<&[u8]> = h1.chunks(REC).collect();
-    let files = setup_files(&h0, recs.len(), place, keep);
-    if files.is_empty() {
-        return Ok(0);
+    let mut files = setup_files(&h0, recs.len(), place, keep);
+    if place != "{tmp}" {
+        // `{app}\` also starts [Icons] and [Run] entries, which the search
+        // reads as files with the location of some other file. A real file
+        // has a location no other entry uses.
+        let all = setup_files(&h0, recs.len(), "{app}", &|_| true);
+        let tmp = setup_files(&h0, recs.len(), "{tmp}", &|_| true);
+        files.retain(|(_, l)| {
+            !tmp.iter().any(|(_, t)| t == l) && all.iter().filter(|(_, a)| a == l).count() <= 1
+        });
     }
+    let names: Vec<String> = files.iter().map(|(n, _)| n.clone()).collect();
+    let Some(out) = out.filter(|_| !files.is_empty()) else {
+        return Ok(names);
+    };
 
     // The data area starts at the first "zlb\x1a" that every chunk offset
     // lines up from.
@@ -385,7 +400,7 @@ fn carve_place(
             fs::write(&path, &file).with_context(|| format!("writing {}", path.display()))?;
         }
     }
-    Ok(files.len())
+    Ok(names)
 }
 
 #[cfg(test)]
