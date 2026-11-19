@@ -108,19 +108,14 @@ The `--check` figures come before any decoding. They assume the freed input keep
 
 ## Status
 
-Every result below was run on real repacks. "Every CRC matching" means each file's CRC-32 matched the one stored in the FreeArc directory.
+Tested on real repacks. Every file's CRC-32 matched the one stored in the archive.
 
-| Repack | Data | Result |
+| Repack | Methods | Unpacked |
 |---|---|---|
-| Crusader Kings III [DODI Repack], `data1.doi` | 5.74 GB solid block, `cls-lolz` + `cls-srep` | 51,467 files, 19.37 GB, every CRC matching. About 5.5 min for verify plus extract |
-| Crusader Kings III [DODI Repack], `data2.doi` | `cls-lolz` + `cls-srep` | 1,177 files, 496 MB, every CRC matching, about 10 s. Also freed as read: the repack copy was used up, and the files were identical to a run that kept it |
-| A FitGirl repack, `fg-01` | `xt2png+pref+srep+magic2` | 7,329 files, 2.13 GB, every CRC matching |
-| A FitGirl repack, `fg-02` | `mpzz+srep` | 2,992 files, 136.53 MB, every CRC matching |
-| A FitGirl repack, `fg-03`, `fg-05` | `srep+dispack070+delta+rzwb`, with built-in `dispack070` and `delta` | 14 and 3 files, 106.77 MB and 303.65 KB, every CRC matching |
-| A FitGirl repack, `fg-04` | `magic2` | 1 file, 638.62 KB, CRC matching |
-| A FitGirl repack, `fg-selective-videos-sd` | `srep+4x4:rzw` | 3,676 files, 2.65 GB, every CRC matching |
+| Crusader Kings III (DODI), 2 data files | `cls-lolz` + `cls-srep` | 52,644 files, 19.9 GB, about 6 min |
+| A FitGirl repack, 6 data files | `srep`, `magic2`, `mpzz`, `xt2png`, `dispack070`, `delta`, `4x4:rzw` | 14,015 files, 5.0 GB |
 
-FitGirl's own MD5 lists name 14,011 game files, and 4,210 of them match the output byte for byte. The other 9,800 are RPG Maker MV images and audio that the repack stores unencrypted, and its installer encrypts them afterwards. One file, a title movie, ships inside `Setup.exe` rather than in any data file.
+Freeing the repack while reading it gave the same files as keeping it. Against FitGirl's MD5 list, 4,210 of 14,011 files match byte for byte: the rest are images and audio its installer encrypts after unpacking, plus one movie inside `Setup.exe`.
 
 No repack using `tor` or `lzma` has been tried yet. Archives made by FreeArc 0.67's own `Arc.exe` from 137 MB of game files, programs and text extract with every CRC matching. That covers `tor:1` to `tor:11`, `lzma` fast, normal and max, and `4x4` around both, including frames 4x4 stored because they didn't compress. FreeArc's `-m1` to `-m9` presets also use `rep`, `exe`, `grzip` or `ppmd`, so archives made with them are still refused.
 
