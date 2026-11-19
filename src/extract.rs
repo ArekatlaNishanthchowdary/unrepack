@@ -220,8 +220,15 @@ fn arc_ini(text: &str) -> Vec<IniSection> {
 
 impl External {
     /// Builds the decoder for `name` from an arc.ini section, with programs
-    /// taken only from `dir`.
-    fn from_ini(text: &str, dir: &Path, name: &str, params: &str) -> Result<Option<External>> {
+    /// taken only from `dir`. `pending`: programs not there yet that an
+    /// earlier step puts in `dir` (a FitGirl repack unpacks its xtool).
+    fn from_ini(
+        text: &str,
+        dir: &Path,
+        name: &str,
+        params: &str,
+        pending: &[PathBuf],
+    ) -> Result<Option<External>> {
         let Some((_, keys)) = arc_ini(text)
             .into_iter()
             .find(|(n, _)| n.iter().any(|n| n == name))
@@ -259,13 +266,22 @@ impl External {
             "arc.ini method '{name}' has an empty unpackcmd"
         );
         let prog = toks.remove(0);
+        // `xt4\xtool.exe` is fine; anything that could leave the folder isn't.
         ensure!(
-            !prog.contains(['/', '\\', ':']),
+            !prog.contains(['/', ':'])
+                && Path::new(&prog)
+                    .components()
+                    .all(|c| matches!(c, std::path::Component::Normal(_))),
             "arc.ini method '{name}' names a program outside the decoders folder"
         );
         let exe = [dir.join(&prog), dir.join(format!("{prog}.exe"))]
             .into_iter()
-            .find(|p| p.is_file())
+            .find(|p| {
+                p.is_file()
+                    || pending
+                        .iter()
+                        .any(|q| q.as_os_str().eq_ignore_ascii_case(p.as_os_str()))
+            })
             .with_context(|| {
                 format!(
                     "arc.ini method '{name}' needs {prog}, missing from {}",
@@ -510,6 +526,8 @@ pub struct Decoders {
     pub host: PathBuf,
     /// Where the decoders run: srep and lolz put temp files in `.\`.
     pub work: PathBuf,
+    /// Files a later step puts in `dir`; see `External::from_ini`.
+    pub pending: Vec<PathBuf>,
 }
 
 impl Decoders {
@@ -586,7 +604,7 @@ impl Decoders {
             );
             return Ok(Some(Decode::Cls(p)));
         }
-        Ok(External::from_ini(&ini, dir, name, params)?.map(Decode::Ext))
+        Ok(External::from_ini(&ini, dir, name, params, &self.pending)?.map(Decode::Ext))
     }
 
     /// Everything a block needs, checked before anything is touched.
@@ -1135,6 +1153,7 @@ mod tests {
             dir: Err("no decoders in this test".into()),
             host: PathBuf::new(),
             work: PathBuf::new(),
+            pending: Vec::new(),
         };
         let (name, params) = method.split_once(':').unwrap_or((method, ""));
         dec.resolve(name, params).unwrap()
@@ -1170,6 +1189,7 @@ mod tests {
             dir: Err("none".into()),
             host: PathBuf::new(),
             work: PathBuf::new(),
+            pending: Vec::new(),
         };
         for bad in ["zz", "a", "lc9", "pb5", "d8gb"] {
             assert!(dec.resolve("lzma", bad).is_err(), "{bad}");
@@ -1215,6 +1235,7 @@ mod tests {
             dir: Ok(dir.path().into()),
             host: PathBuf::new(),
             work: PathBuf::new(),
+            pending: Vec::new(),
         };
         assert!(matches!(
             dec.resolve("lzma", "96mb").unwrap(),
@@ -1264,6 +1285,7 @@ mod tests {
             dir: Err("none".into()),
             host: PathBuf::new(),
             work: dir.path().join("work"),
+            pending: Vec::new(),
         };
         let out = dir.path().join("out");
         let file = File::open(&data).unwrap();
@@ -1284,6 +1306,7 @@ mod tests {
             dir: Err("none".into()),
             host: PathBuf::new(),
             work: PathBuf::new(),
+            pending: Vec::new(),
         };
         let dir = tempfile::tempdir().unwrap();
         for (params, s) in [
@@ -1375,23 +1398,23 @@ mod tests {
                    [External compressor:xt2p,xt2png,xt2]\nheader    = 0\nunpackcmd = xtool.exe decode -t100p - - <stdin> <stdout>\n\n\
                    [External compressor:bcm]\nunpackcmd = bcm -d $$arcpackedfile$$.tmp $$arcdatafile$$.tmp\n";
         fs::write(dir.path().join("arc.ini"), ini).unwrap();
-        let e = External::from_ini(ini, dir.path(), "rzwb", "")
+        let e = External::from_ini(ini, dir.path(), "rzwb", "", &[])
             .unwrap()
             .unwrap();
         assert_eq!(e.exe, dir.path().join("rzw.exe"));
         assert_eq!(e.args, ["d", "f2", "f1", "1023", "1023"]);
         assert_eq!(e.files, Some(("f2".into(), "f1".into())));
-        let e = External::from_ini(ini, dir.path(), "xt2png", "")
+        let e = External::from_ini(ini, dir.path(), "xt2png", "", &[])
             .unwrap()
             .unwrap();
         assert_eq!(e.args, ["decode", "-t100p", "-", "-"]);
         assert_eq!(e.files, None);
         assert!(
-            External::from_ini(ini, dir.path(), "bcm", "").is_err(),
+            External::from_ini(ini, dir.path(), "bcm", "", &[]).is_err(),
             "header=1"
         );
         assert!(
-            External::from_ini(ini, dir.path(), "lolz", "")
+            External::from_ini(ini, dir.path(), "lolz", "", &[])
                 .unwrap()
                 .is_none()
         );
@@ -1400,6 +1423,7 @@ mod tests {
             dir: Ok(dir.path().into()),
             host: dir.path().join("rzw.exe"),
             work: dir.path().into(),
+            pending: Vec::new(),
         };
         assert!(matches!(dec.resolve("magic2", ""), Ok(Decode::Cls(_))));
         assert!(matches!(

@@ -7,7 +7,9 @@ mod log;
 mod builtin;
 mod extract;
 mod freearc;
+mod ifps;
 mod inno;
+mod recipe;
 mod tornado;
 mod win;
 
@@ -121,6 +123,226 @@ fn has_decoders(dir: &Path) -> bool {
     })
 }
 
+fn setup_in(dir: &Path) -> Option<PathBuf> {
+    fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| {
+            p.file_name()
+                .is_some_and(|n| n.eq_ignore_ascii_case("setup.exe"))
+        })
+}
+
+/// The steps Setup.exe's script takes, when following them matters (see
+/// [`recipe::needed`]). A script unrepack can't read is passed over: the
+/// data files still extract by name, as before.
+fn recipe_for(dir: &Path) -> Result<Option<Vec<recipe::Step>>> {
+    let Some(setup) = setup_in(dir) else {
+        return Ok(None);
+    };
+    let Ok(Some(code)) = inno::script(&setup) else {
+        return Ok(None);
+    };
+    let calls = match ifps::Script::parse(&code).and_then(|s| s.calls("CurStepChanged")) {
+        Ok(c) => c,
+        Err(e) => {
+            note!("can't follow Setup.exe's script ({e:#}); extracting by file name");
+            return Ok(None);
+        }
+    };
+    if !calls
+        .iter()
+        .any(|c| c.name.eq_ignore_ascii_case("ISArcExtract"))
+    {
+        return Ok(None);
+    }
+    let steps = recipe::steps(&calls).context("following Setup.exe's install steps")?;
+    Ok(recipe::needed(&steps).then_some(steps))
+}
+
+/// Sets `key` in `[section]` of an ini file, adding either if missing.
+/// `{app}` and `{tmp}` become `.`, as in the ini files read out of Setup.
+fn set_ini(path: &Path, section: &str, key: &str, value: &str) -> Result<()> {
+    let text = fs::read_to_string(path).unwrap_or_default();
+    let value = value.replace("{app}", ".").replace("{tmp}", ".");
+    let mut lines: Vec<String> = text.lines().map(String::from).collect();
+    let head = |l: &str| {
+        l.trim()
+            .strip_prefix('[')
+            .and_then(|r| r.strip_suffix(']'))
+            .map(str::trim)
+            .map(str::to_owned)
+    };
+    let start = lines
+        .iter()
+        .position(|l| head(l).is_some_and(|h| h.eq_ignore_ascii_case(section)));
+    let line = format!("{key}={value}");
+    match start {
+        None => {
+            lines.push(format!("[{section}]"));
+            lines.push(line);
+        }
+        Some(s) => {
+            let end = (s + 1..lines.len())
+                .find(|&i| head(&lines[i]).is_some())
+                .unwrap_or(lines.len());
+            let at = (s + 1..end).find(|&i| {
+                lines[i]
+                    .split_once('=')
+                    .is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case(key))
+            });
+            match at {
+                Some(i) => lines[i] = line,
+                None => lines.insert(end, line),
+            }
+        }
+    }
+    fs::write(path, lines.join("\r\n") + "\r\n")
+        .with_context(|| format!("writing {}", path.display()))
+}
+
+/// Runs one of Setup's commands and waits for it. A non-zero exit stops
+/// the run: FitGirl's rebuild steps chain with `&&`, so that means one
+/// failed. ponytail: output shows when it ends, not as it goes.
+fn run_setup_cmd(exe: &str, params: &str, dir: &str, places: &recipe::Places) -> Result<()> {
+    use std::os::windows::process::CommandExt;
+    let (exe, params, dir) = (
+        places.expand(exe)?,
+        places.expand(params)?,
+        places.expand(dir)?,
+    );
+    let dir = if dir.is_empty() {
+        places.tmp.clone()
+    } else {
+        PathBuf::from(&dir)
+    };
+    ensure!(
+        dir.is_dir(),
+        "Setup runs {exe} in {}, which doesn't exist",
+        dir.display()
+    );
+    let lower = exe.to_ascii_lowercase();
+    let mut cmd = if lower.ends_with(".bat") || lower.ends_with(".cmd") {
+        let mut c = std::process::Command::new(places.expand("{cmd}")?);
+        c.raw_arg(format!("/C \"\"{exe}\" {params}\""));
+        c
+    } else {
+        let mut c = std::process::Command::new(&exe);
+        c.raw_arg(&params);
+        c
+    };
+    say!("running {exe} {params}");
+    let o = cmd
+        .current_dir(&dir)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .with_context(|| format!("starting {exe}"))?;
+    for l in String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .chain(String::from_utf8_lossy(&o.stderr).lines())
+        .filter(|l| !l.trim().is_empty())
+    {
+        say!("  {l}");
+    }
+    ensure!(
+        o.status.success(),
+        "{exe} {params} failed ({}); the game folder is incomplete",
+        o.status
+    );
+    Ok(())
+}
+
+/// Does one of Setup's steps. Settings changes were made up front; a data
+/// file not chosen for this run is passed over, as Setup does an unticked one.
+fn setup_step(
+    s: &recipe::Step,
+    pl: &recipe::Places,
+    tools: &[(PathBuf, String, freearc::Archive)],
+    jobs: &[(PathBuf, freearc::Archive)],
+    dec: &Decoders,
+    p: &mut Progress,
+) -> Result<()> {
+    let named = |f: &Path, data: &str| {
+        f.file_name()
+            .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(data))
+    };
+    match s {
+        recipe::Step::Ini { .. } => {}
+        recipe::Step::Extract {
+            data,
+            tools: true,
+            sub,
+        } => {
+            let (f, _, arc) = tools
+                .iter()
+                .find(|(f, ..)| named(f, data))
+                .context("tool archive missing")?;
+            note!("unpacking Setup's tools from {}", f.display());
+            extract_tools(
+                &Job {
+                    data: f,
+                    archive: arc,
+                },
+                sub,
+                dec,
+                &pl.tmp,
+            )?;
+        }
+        recipe::Step::Extract { data, .. } => {
+            if let Some((f, arc)) = jobs.iter().find(|(f, _)| named(f, data)) {
+                note!("extracting {}", f.display());
+                extract::run(
+                    &Job {
+                        data: f,
+                        archive: arc,
+                    },
+                    dec,
+                    &pl.app,
+                    false,
+                    p,
+                )?;
+            }
+        }
+        recipe::Step::Run { exe, params, dir } => run_setup_cmd(exe, params, dir, pl)?,
+        recipe::Step::DelTree(d) => {
+            let d = pl.inside(d)?;
+            if d.is_dir() {
+                fs::remove_dir_all(&d).with_context(|| format!("deleting {}", d.display()))?;
+            }
+        }
+        recipe::Step::DeleteFile(f) => {
+            let f = pl.inside(f)?;
+            if f.is_file() {
+                fs::remove_file(&f).with_context(|| format!("deleting {}", f.display()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A tool archive Setup unpacks into its temp folder: only what is under
+/// `sub` in it, with `sub` taken off (`work\work\x.bat` -> `work\x.bat`).
+fn extract_tools(job: &Job, sub: &str, dec: &Decoders, tmp: &Path) -> Result<()> {
+    let mut p = Progress::new(job.archive.unpacked());
+    if sub.is_empty() {
+        return extract::run(job, dec, tmp, false, &mut p);
+    }
+    let stage = tmp.join(".unrepack-stage");
+    let _ = fs::remove_dir_all(&stage);
+    extract::run(job, dec, &stage, false, &mut p)?;
+    let from = stage.join(sub);
+    for e in fs::read_dir(&from)
+        .with_context(|| format!("{} has no {sub} folder", job.data.display()))?
+    {
+        let e = e?;
+        let to = tmp.join(e.file_name());
+        ensure!(!to.exists(), "{} already exists", to.display());
+        fs::rename(e.path(), &to).with_context(|| format!("moving {}", e.path().display()))?;
+    }
+    fs::remove_dir_all(&stage).with_context(|| format!("removing {}", stage.display()))
+}
+
 /// A folder of decoders read out of Setup.exe, removed when the run ends.
 /// ponytail: a killed run leaves it in %TEMP%; sweep old ones if that piles up.
 struct Carved(PathBuf);
@@ -148,15 +370,7 @@ fn find_decoders(given: Option<&Path>, first: &Path) -> Result<Found> {
     if has_decoders(dir) {
         return Ok((Ok(dir.to_path_buf()), None));
     }
-    let setup = fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .find(|p| {
-            p.file_name()
-                .is_some_and(|n| n.eq_ignore_ascii_case("setup.exe"))
-        });
-    let Some(setup) = setup else {
+    let Some(setup) = setup_in(dir) else {
         return Ok((Err(HOW.into()), None));
     };
     let tmp = std::env::temp_dir().join(format!("unrepack-decoders-{}", std::process::id()));
@@ -193,7 +407,7 @@ fn data_files(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
             let mut found: Vec<PathBuf> = fs::read_dir(p)
                 .with_context(|| format!("listing {}", p.display()))?
                 .filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| p.is_file() && freearc::sniff(p))
+                .filter(|p| p.is_file())
                 .collect();
             let name = |p: &Path| {
                 p.file_name()
@@ -201,6 +415,30 @@ fn data_files(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
                     .to_string_lossy()
                     .to_lowercase()
             };
+            // A language or extra left out of a download is often there in
+            // part (the torrent's shared pieces): skip it, as the installer
+            // does a missing one. A broken game file still stops the run.
+            found.retain(|f| {
+                if !freearc::sniff(f) {
+                    // ponytail: a language pack is the only name we know is
+                    // a data file; Setup.exe and the rest stay quiet.
+                    if language(&name(f)).is_some() && f.metadata().is_ok_and(|m| m.len() > 0) {
+                        note!(
+                            "skipping {}: incomplete or damaged (its start is missing)",
+                            name(f)
+                        );
+                    }
+                    return false;
+                }
+                if kind(&name(f)) == Kind::Required {
+                    return true;
+                }
+                let e = freearc::open(f).err();
+                if let Some(e) = &e {
+                    note!("skipping {}: incomplete or damaged ({e})", name(f));
+                }
+                e.is_none()
+            });
             found.sort_by_cached_key(|p| order(&name(p)));
             ensure!(
                 !found.is_empty(),
@@ -479,6 +717,64 @@ fn extract_cmd(a: Args) -> Result<()> {
         .clone()
         .context("say where to extract with -o <folder>")?;
     let files = data_files(&a.inputs)?;
+    let src_dir = files[0].parent().map(Path::to_path_buf).unwrap_or_default();
+    let lname = |p: &Path| {
+        p.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_lowercase()
+    };
+    let steps = recipe_for(&src_dir)?;
+    // Archives Setup unpacks into its temp folder for later steps: (file,
+    // the folder in it that's wanted, index).
+    let mut tools = Vec::new();
+    let files = match &steps {
+        None => files,
+        Some(steps) => {
+            // Setup's order, which isn't the number order: Cyberpunk's goes
+            // fg-07, 05, 04, 03, 08, 02, 01, the languages, then fg-06.
+            let mut app = Vec::new();
+            for s in steps {
+                let recipe::Step::Extract {
+                    data,
+                    tools: t,
+                    sub,
+                } = s
+                else {
+                    continue;
+                };
+                if *t {
+                    let path = src_dir.join(data);
+                    let arc = freearc::open(&path).with_context(|| {
+                        format!("Setup unpacks its tools from {}", path.display())
+                    })?;
+                    tools.push((path, sub.clone(), arc));
+                } else if let Some(f) = files.iter().find(|f| lname(f) == data.to_lowercase()) {
+                    app.push(f.clone());
+                }
+            }
+            for f in &files {
+                let n = lname(f);
+                if !app.contains(f) && !tools.iter().any(|(t, ..)| lname(t) == n) {
+                    note!("skipping {n}: Setup.exe doesn't unpack it");
+                }
+            }
+            say!(
+                "following Setup.exe's install steps: {} tool archive(s), {} data file(s), {} command(s) it runs",
+                tools.len(),
+                app.len(),
+                steps
+                    .iter()
+                    .filter(|s| matches!(s, recipe::Step::Run { .. }))
+                    .count()
+            );
+            ensure!(
+                !app.is_empty(),
+                "none of these data files is one Setup.exe unpacks"
+            );
+            app
+        }
+    };
     let mut jobs = Vec::new();
     for f in &files {
         ensure!(
@@ -499,8 +795,56 @@ fn extract_cmd(a: Args) -> Result<()> {
         None => std::env::current_exe()?.with_file_name("unrepack-clshost.exe"),
     };
     let work = a.work.clone().unwrap_or_else(|| out.join(".unrepack-work"));
-    let (dir, _carved) = find_decoders(a.decoders.as_deref(), &files[0])?;
-    let dec = Decoders { dir, host, work };
+    let (dir, carved) = find_decoders(a.decoders.as_deref(), &files[0])?;
+    let mut dec = Decoders {
+        dir,
+        host,
+        work,
+        pending: Vec::new(),
+    };
+    // With Setup's steps, the decoders' folder stands in for its {tmp}: its
+    // tools are unpacked into it and its decoder settings changed there.
+    let mut places = None;
+    if let Some(steps) = &steps {
+        let tmp = carved.as_ref().map(|c| c.0.clone()).context(
+            "this repack's Setup.exe unpacks its own tools, so unrepack reads the decoders out of it; \
+             drop --decoders and keep Setup.exe next to the data files",
+        )?;
+        for (f, sub, arc) in &tools {
+            for b in &arc.blocks {
+                dec.check(b).with_context(|| format!("{}", f.display()))?;
+                for e in b.entries.iter().filter(|e| !e.is_dir) {
+                    let rel = e.path.to_string_lossy().into_owned();
+                    let rel = if sub.is_empty() {
+                        Some(rel.as_str())
+                    } else {
+                        rel.get(..sub.len() + 1)
+                            .filter(|h| h.eq_ignore_ascii_case(&format!("{sub}\\")))
+                            .map(|_| &rel[sub.len() + 1..])
+                    };
+                    if let Some(r) = rel {
+                        dec.pending.push(tmp.join(r));
+                    }
+                }
+            }
+        }
+        for s in steps {
+            if let recipe::Step::Ini {
+                file,
+                section,
+                key,
+                value,
+            } = s
+            {
+                set_ini(&tmp.join(file), section, key, value)?;
+            }
+        }
+        places = Some(recipe::Places {
+            tmp,
+            app: out.clone(),
+            src: src_dir.clone(),
+        });
+    }
 
     // Everything refusable is refused here, before anything changes.
     let mut seen = std::collections::HashMap::new();
@@ -554,6 +898,13 @@ fn extract_cmd(a: Args) -> Result<()> {
         }
     }
     let delete_each = a.delete_each && same_volume;
+    // ponytail: FitGirl's rebuild scripts get {src} patched in and may read
+    // the repack; allow these once it's known they don't.
+    ensure!(
+        steps.is_none() || !(consume || delete_each),
+        "this repack's Setup.exe runs commands after unpacking that may read the repack, so it \
+         has to be kept: drop --free-as-read and --delete-each"
+    );
     let total_out: u64 = jobs.iter().map(|(_, a)| a.unpacked()).sum();
     let total_in: u64 = jobs.iter().map(|(_, a)| a.len).sum();
     let need = space_needed(&jobs, consume, delete_each);
@@ -573,7 +924,7 @@ fn extract_cmd(a: Args) -> Result<()> {
             ""
         }
     );
-    if !consume {
+    if !consume && steps.is_none() {
         let with_free = space_needed(&jobs, same_volume, false);
         if with_free < need {
             say!("with --free-as-read it would need {}", human(with_free));
@@ -606,6 +957,25 @@ fn extract_cmd(a: Args) -> Result<()> {
         }
     }
     fs::create_dir_all(&dec.work).with_context(|| format!("creating {}", dec.work.display()))?;
+
+    // Setup's steps up to its first unpack into the game folder, and every
+    // tool archive: the verify pass and later steps need them. All of this
+    // touches only the decoders' folder.
+    let mut first = 0;
+    if let (Some(steps), Some(pl)) = (&steps, &places) {
+        first = steps
+            .iter()
+            .position(|s| matches!(s, recipe::Step::Extract { tools: false, .. }))
+            .unwrap_or(steps.len());
+        let early = steps[..first].iter().chain(
+            steps[first..]
+                .iter()
+                .filter(|s| matches!(s, recipe::Step::Extract { tools: true, .. })),
+        );
+        for s in early {
+            setup_step(s, pl, &tools, &[], &dec, &mut Progress::new(0))?;
+        }
+    }
 
     if a.verify {
         let mut p = Progress::new(total_out);
@@ -657,6 +1027,20 @@ fn extract_cmd(a: Args) -> Result<()> {
         note!("extracting");
     }
     let mut p = Progress::new(total_out);
+    if let (Some(steps), Some(pl)) = (&steps, &places) {
+        for s in &steps[first..] {
+            if !matches!(s, recipe::Step::Extract { tools: true, .. }) {
+                setup_step(s, pl, &tools, &jobs, &dec, &mut p)?;
+            }
+        }
+        let _ = fs::remove_dir(&dec.work);
+        say!(
+            "done: {} in {}, and Setup's steps after it",
+            human(total_out),
+            out.display()
+        );
+        return Ok(());
+    }
     for (f, arc) in &jobs {
         note!("extracting {}", f.display());
         extract::run(
@@ -720,6 +1104,65 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Needs the Cyberpunk 2077 FitGirl repack next to this folder.
+    #[test]
+    #[ignore]
+    fn cyberpunk_setup_steps() {
+        let steps = recipe_for(Path::new("../Cyberpunk 2077 [FitGirl Repack]"))
+            .unwrap()
+            .unwrap();
+        let order: Vec<String> = steps
+            .iter()
+            .filter_map(|s| match s {
+                recipe::Step::Extract { data, tools, .. } => {
+                    Some(format!("{}{data}", if *tools { "tmp:" } else { "" }))
+                }
+                _ => None,
+            })
+            .take(8)
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "tmp:fg-07.bin",
+                "fg-05.bin",
+                "fg-04.bin",
+                "fg-03.bin",
+                "tmp:fg-08.bin",
+                "fg-02.bin",
+                "fg-optional-credits.bin",
+                "fg-01.bin"
+            ]
+        );
+        assert!(steps.contains(&recipe::Step::Run {
+            exe: r"{tmp}\work\build01.bat".into(),
+            params: String::new(),
+            dir: r"{app}\archive\pc\content\audio_2_soundbanks\".into(),
+        }));
+    }
+
+    #[test]
+    fn set_ini_replaces_adds_and_maps_folders() {
+        let d = std::env::temp_dir().join(format!("unrepack-ini-{}", std::process::id()));
+        fs::create_dir_all(&d).unwrap();
+        let f = d.join("arc.ini");
+        fs::write(&f, "[External compressor:bz3s,bz3]\nheader = 0\nunpackcmd = bzip3 -j fgrplc\n[Other]\nx=1\n").unwrap();
+        set_ini(
+            &f,
+            "external compressor:bz3s,bz3",
+            "unpackcmd",
+            "bzip3 -j 4",
+        )
+        .unwrap();
+        set_ini(&f, "Other", "TempPath", "{app}").unwrap();
+        set_ini(&f, "New", "k", "v").unwrap();
+        assert_eq!(
+            fs::read_to_string(&f).unwrap(),
+            "[External compressor:bz3s,bz3]\r\nheader = 0\r\nunpackcmd=bzip3 -j 4\r\n[Other]\r\nx=1\r\nTempPath=.\r\n[New]\r\nk=v\r\n"
+        );
+        fs::remove_dir_all(&d).unwrap();
+    }
 
     fn arc(len: u64, out: u64) -> freearc::Archive {
         freearc::Archive {

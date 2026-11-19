@@ -194,13 +194,16 @@ fn wstr(b: &[u8], i: usize) -> Option<(String, usize)> {
     Some((String::from_utf16(&units).ok()?, i + 4 + n))
 }
 
-/// A plain file name, nothing that could leave the folder.
+/// A file name, or a path of them under the folder (`_Redist\builder.exe`):
+/// nothing that could leave it.
 fn safe_name(n: &str) -> bool {
-    !n.is_empty()
-        && n != "."
-        && n != ".."
-        && !n.contains(['\\', '/', ':', '\0'])
-        && !n.ends_with(['.', ' '])
+    n.split('\\').all(|n| {
+        !n.is_empty()
+            && n != "."
+            && n != ".."
+            && !n.contains(['/', ':', '\0'])
+            && !n.ends_with(['.', ' '])
+    })
 }
 
 /// `(name, location index)` of every file the installer puts straight into
@@ -247,6 +250,27 @@ fn patch_ini(b: &[u8]) -> Vec<u8> {
         }
     }
     out
+}
+
+/// The installer's compiled [Code] script, if it has one. ponytail: found
+/// by its "IFPS" signature and the length in front of it, not by walking
+/// the header's string fields up to CompiledCodeText.
+pub fn script(setup: &Path) -> Result<Option<Vec<u8>>> {
+    let data = fs::read(setup).with_context(|| format!("reading {}", setup.display()))?;
+    let Some(id) = data.windows(ID.len()).rposition(|w| w == ID) else {
+        bail!("not an Inno Setup 5.5 installer, the only kind unrepack can read");
+    };
+    let mut p = id + 64;
+    let h0 = header_block(&data, &mut p)?;
+    Ok(h0
+        .windows(4)
+        .enumerate()
+        .skip(4)
+        .filter(|(_, w)| *w == b"IFPS")
+        .find_map(|(i, _)| {
+            let n = u32le(&h0, i - 4) as usize;
+            h0.get(i..i + n).map(<[u8]>::to_vec)
+        }))
 }
 
 /// Writes the files the installer would put in `{tmp}` (its decoders among
@@ -325,6 +349,9 @@ pub fn carve(setup: &Path, out: &Path) -> Result<usize> {
                 file = patch_ini(&file);
             }
             let path = out.join(name);
+            if let Some(dir) = path.parent() {
+                fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+            }
             fs::write(&path, &file).with_context(|| format!("writing {}", path.display()))?;
         }
     }
@@ -408,7 +435,10 @@ mod tests {
             b"TempPath=.\r\nTmp=.\\x\r\n{ap"
         );
         assert!(safe_name("cls-srep.dll"));
-        for bad in ["", ".", "..", "a\\b", "a/b", "c:x", "x.", "x "] {
+        assert!(safe_name("_Redist\\builder.exe"));
+        for bad in [
+            "", ".", "..", "a\\..\\b", "\\a", "a\\", "a/b", "c:x", "x.", "x ",
+        ] {
             assert!(!safe_name(bad), "{bad:?}");
         }
     }
