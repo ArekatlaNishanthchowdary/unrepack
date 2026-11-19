@@ -459,6 +459,18 @@ fn language_packs_are_parts_and_the_later_copy_wins() {
         &sample_files(),
         false,
     );
+    // As GoW's data2.doi: the base game's copy of a file each language
+    // pack replaces. Sorted by name it would come after the packs.
+    write_archive(
+        &t.path().join("data2.doi"),
+        "storing",
+        &[File {
+            dir: "sound",
+            name: "desktop.ini",
+            data: b"[base]".to_vec(),
+        }],
+        false,
+    );
     pack("English.doi", b"[en]", "vm_enu.fsb");
     pack("French.doi", b"[fr]", "vm_fra.fsb");
     write_archive(
@@ -485,10 +497,11 @@ fn language_packs_are_parts_and_the_later_copy_wins() {
     assert_eq!(
         lines,
         [
+            ("required", "on", "data1.doi"),
+            ("required", "on", "data2.doi"),
             ("optional", "on", "Artwork.doi"),
             ("language", "on", "English.doi"),
             ("language", "off", "French.doi"),
-            ("required", "on", "data1.doi"),
         ]
     );
 
@@ -511,6 +524,17 @@ fn language_packs_are_parts_and_the_later_copy_wins() {
         "{}",
         String::from_utf8_lossy(&o.stderr)
     );
+
+    // The whole folder: the required files go first, so a language pack's
+    // copy wins over the base game's, as with the installer.
+    let all = t.path().join("all");
+    ok(&unrepack(&[
+        "extract".as_ref(),
+        t.path().as_os_str(),
+        "-o".as_ref(),
+        all.as_os_str(),
+    ]));
+    assert_eq!(fs::read(all.join("sound/desktop.ini")).unwrap(), b"[fr]");
 }
 
 #[test]

@@ -182,7 +182,10 @@ fn find_decoders(given: Option<&Path>, first: &Path) -> Result<Found> {
     }
 }
 
-/// Data files named directly, or every FreeArc file in a folder, by name.
+/// Data files named directly, or every FreeArc file in a folder: the
+/// required ones first, as DODI's installer extracts them, then by name.
+/// Order matters where a file is in two of them: GoW's data2.doi holds
+/// English's copy of the language file each language pack replaces.
 fn data_files(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     for p in inputs {
@@ -192,7 +195,14 @@ fn data_files(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
                 .filter_map(|e| e.ok().map(|e| e.path()))
                 .filter(|p| p.is_file() && freearc::sniff(p))
                 .collect();
-            found.sort();
+            found.sort_by_cached_key(|p| {
+                let n = p
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_lowercase();
+                (kind(&n) != Kind::Required, n)
+            });
             ensure!(
                 !found.is_empty(),
                 "no FreeArc data files in {}",
