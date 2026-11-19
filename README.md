@@ -1,6 +1,10 @@
 <h1 align="center">unrepack</h1>
 
 <p align="center">
+  <img src="docs/intro.gif" width="960" alt="A repack's data file, drawn as a stack of grey layers, peels away one layer at a time; each layer unpacks into files that stack up as the game, while a drive-usage bar grows only to the game's size and never reaches the repack-plus-game line an installer would need.">
+</p>
+
+<p align="center">
   Unpack FreeArc game repacks without running their installer.<br>
   The repack can give its space back while it is read, so the repack and the game<br>
   never have to fit on the disk <em>together</em>.
