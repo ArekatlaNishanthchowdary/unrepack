@@ -20,7 +20,7 @@
 </h4>
 
 <p align="center">
-  <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" alt="MIT or Apache-2.0 licensed, except src/builtin.rs" /></a>
+  <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" alt="MIT or Apache-2.0 licensed, except src/builtin.rs and src/tornado.rs" /></a>
   <img src="https://img.shields.io/badge/platform-windows-blue.svg" alt="Windows only" />
   <img src="https://img.shields.io/badge/version-0.1-orange.svg" alt="Version 0.1" />
 </p>
@@ -105,8 +105,9 @@ FitGirl's own MD5 lists name 14,011 game files, and 4,210 of them match the outp
 | FreeArc directory, footer and CRCs | Works |
 | CLS plug-ins (`cls-*.dll`) through the 32-bit host | Works |
 | External decoders from `arc.ini`, and `4x4` around them | Works |
-| FreeArc built-ins `delta` and `dispack070` | Works, ported natively |
-| Other FreeArc built-ins (`lzma`, `ppmd`, `tornado`, `rep`, `exe`, …) | Not yet: refused before anything is changed |
+| FreeArc built-ins `delta`, `dispack070` and `tor` (Tornado) | Works, ported natively |
+| FreeArc built-in `lzma` | Works, through the `lzma-rust2` crate |
+| Other FreeArc built-ins (`ppmd`, `rep`, `exe`, `lzma2`, …), and `4x4` around a built-in | Not yet: refused before anything is changed |
 | Resume after a crash | Not in 0.1 |
 | Installer steps (registry, redistributables, language choice, post-install patches such as FitGirl's RTPatch `.x3` files and `restore-duplicates.bat`) | Not done. Only the files inside the data files are extracted |
 
@@ -130,7 +131,7 @@ A FreeArc data file is a series of solid blocks, each packed by a chain of metho
 
 - **CLS plug-ins** are 32-bit DLLs. Each one runs in `unrepack-clshost.exe`, a small 32-bit host process, and data goes through pipes.
 - **External decoders** from `arc.ini` run as processes in the work folder.
-- **`4x4`**, **`delta`** and **`dispack070`** run as threads inside unrepack. `delta` and `dispack070` are Rust ports of FreeArc 0.67's decoders, and their tables match the repack's own `unarc.dll` byte for byte.
+- **`4x4`**, **`delta`**, **`dispack070`**, **`tor`** and **`lzma`** run as threads inside unrepack. `delta`, `dispack070` and `tor` are Rust ports of FreeArc 0.67's decoders, and the tables of the first two match the repack's own `unarc.dll` byte for byte. `lzma` is FreeArc's raw LZMA stream, with its settings taken from the method string.
 
 The last stage's output is cut into files, and each file's CRC is checked. With `--free-as-read`, unrepack zeroes the parts of the data file it has read as a sparse range (`FSCTL_SET_ZERO_DATA`), so NTFS gives that space back while the file keeps its size and offsets. Once a data file is fully read, it is deleted.
 
@@ -144,13 +145,13 @@ gcc -m32 -O2 -s -static -o target/release/unrepack-clshost.exe clshost/clshost.c
 cargo test --release
 ```
 
-`cargo build --release` builds both `unrepack.exe` and the app, `unrepack-gui.exe` (egui, a single native exe). The 25 tests write FreeArc archives in the layout measured from real repacks and run the binary on them. They use `storing`, `copy`, and a CLS codec built from `clshost/test_copy.c`, so the host process runs as it does with a repack's decoders. `delta` and `dispack070` are tested on hand-built streams. `UNREPACK_SAMPLE=<data file> cargo test real_sample` also parses a real data file, and `UNREPACK_DUMP=<dir>` saves every stage's output for debugging.
+`cargo build --release` builds both `unrepack.exe` and the app, `unrepack-gui.exe` (egui, a single native exe). The tests write FreeArc archives in the layout measured from real repacks and run the binary on them. They use `storing`, `copy`, and a CLS codec built from `clshost/test_copy.c`, so the host process runs as it does with a repack's decoders. `delta` and `dispack070` are tested on hand-built streams. `tor` and `lzma` are tested on streams made by FreeArc 0.67's own Tornado compressor and by liblzma (see [testdata/README.md](testdata/README.md)). `UNREPACK_SAMPLE=<data file> cargo test real_sample` also parses a real data file, and `UNREPACK_DUMP=<dir>` saves every stage's output for debugging.
 
 ## License
 
-unrepack is licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT), at your option, **except `src/builtin.rs`**.
+unrepack is licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT), at your option, **except `src/builtin.rs` and `src/tornado.rs`**.
 
-`src/builtin.rs` holds the ports of FreeArc's `delta` and `dispack070` decoders, and it stays under the terms of the FreeArc source it comes from ([LICENSE-FREEARC](LICENSE-FREEARC)). The `delta` decoder is free to use only for decompressing FreeArc archives, and it is not open source. `dispack070` comes from FreeArc's GPL-2.0 tree. Without that one file, unrepack is open source throughout, but it can't decode repacks that use those two methods.
+`src/builtin.rs` holds the ports of FreeArc's `delta` and `dispack070` decoders, and `src/tornado.rs` the port of its `tor` decoder. Both stay under the terms of the FreeArc source they come from ([LICENSE-FREEARC](LICENSE-FREEARC)). The `delta` decoder is free to use only for decompressing FreeArc archives, and it is not open source. `dispack070` and `tor` come from FreeArc's GPL-2.0 tree. Without those two files, unrepack is open source throughout, but it can't decode repacks that use those three methods.
 
 Parts of `src/win.rs` are adapted from [HatchZip](https://github.com/xevrion/hatchzip) under its MIT license. That copyright notice is kept in [LICENSE-MIT](LICENSE-MIT).
 

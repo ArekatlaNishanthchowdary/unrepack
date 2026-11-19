@@ -8,6 +8,7 @@ mod builtin;
 mod extract;
 mod freearc;
 mod inno;
+mod tornado;
 mod win;
 
 use std::fs;

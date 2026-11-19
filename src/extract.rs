@@ -37,8 +37,8 @@ pub enum Stage {
 
 /// FreeArc methods compiled into unarc.dll that unrepack doesn't port yet.
 const BUILT_IN: &[&str] = &[
-    "exe", "exe2", "lzma", "lzma2", "ppmd", "tornado", "lzp", "grzip", "rep", "dict", "mm", "tta",
-    "lz4", "bcj", "bcj2",
+    "exe", "exe2", "lzma2", "ppmd", "lzp", "grzip", "rep", "dict", "mm", "tta", "lz4", "bcj",
+    "bcj2",
 ];
 
 /// What runs one stage.
@@ -56,6 +56,110 @@ enum Decode {
     Delta,
     /// `dispack070`, with its block size.
     Dispack(usize),
+    /// `lzma`: raw LZMA1 up to its end marker, with dictionary, lc, lp, pb
+    /// taken from the method string.
+    Lzma(Lzma),
+    /// `tor` (Tornado), ported in `tornado.rs`; the stream has its own header.
+    Tornado,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Lzma {
+    dict: u32,
+    lc: u32,
+    lp: u32,
+    pb: u32,
+}
+
+/// FreeArc's `parseMem`: digits, then b, k, m, g or ^ (2 to the power), of
+/// which only the first letter counts; no letter means `spec`.
+fn freearc_mem(p: &str, spec: u8) -> Option<u64> {
+    let p = p.strip_prefix('=').unwrap_or(p);
+    let d = p.bytes().take_while(u8::is_ascii_digit).count();
+    let n: u64 = p.get(..d).filter(|s| !s.is_empty())?.parse().ok()?;
+    match p.as_bytes().get(d).copied().unwrap_or(spec) {
+        b'b' => Some(n),
+        b'k' => n.checked_mul(1 << 10),
+        b'm' => n.checked_mul(1 << 20),
+        b'g' => n.checked_mul(1 << 30),
+        b'^' => (n < 64).then(|| 1 << n),
+        _ => None,
+    }
+}
+
+/// `parse_LZMA` (C_LZMA.cpp), keeping only what decoding needs. Its order
+/// matters: named options, then a match finder, a bare number (fast bytes),
+/// and last a memory size (the dictionary). `*` marks an option FreeArc
+/// skips when it can't read it.
+fn lzma_params(params: &str) -> Result<Lzma> {
+    let mut m = Lzma {
+        dict: 64 << 20,
+        lc: 3,
+        lp: 0,
+        pb: 2,
+    };
+    let int = |s: &str| s.parse::<u32>().ok();
+    let mut dict = None;
+    for p in params.split(':').filter(|p| !p.is_empty()) {
+        let (optional, p) = p.strip_prefix('*').map_or((false, p), |r| (true, r));
+        let ok = if let Some(r) = p.strip_prefix('d') {
+            freearc_mem(r, b'^').map(|n| dict = Some(n)).is_some()
+        } else if p.starts_with('h') && freearc_mem(&p[1..], b'^').is_some() {
+            true
+        } else if let Some(r) = p.strip_prefix('a') {
+            int(r).is_some()
+        } else if let Some(r) = p.strip_prefix("fb").or_else(|| p.strip_prefix("mc")) {
+            int(r).is_some()
+        } else if let Some(r) = p.strip_prefix("lc") {
+            int(r).map(|n| m.lc = n).is_some()
+        } else if let Some(r) = p.strip_prefix("lp") {
+            int(r).map(|n| m.lp = n).is_some()
+        } else if let Some(r) = p.strip_prefix("pb") {
+            int(r).map(|n| m.pb = n).is_some()
+        } else {
+            p.starts_with("mf")
+                || ["fastest", "fast", "normal", "max", "ultra"].contains(&p)
+                || ["bt2", "bt3", "bt4", "hc4", "ht4"]
+                    .iter()
+                    .any(|f| p.eq_ignore_ascii_case(f))
+                || int(p).is_some()
+                || freearc_mem(p, b'^').map(|n| dict = Some(n)).is_some()
+        };
+        ensure!(
+            ok || optional,
+            "method 'lzma': parameter '{p}' not understood"
+        );
+    }
+    if let Some(d) = dict {
+        m.dict = u32::try_from(d).context("method 'lzma': dictionary over 4 GB")?;
+    }
+    ensure!(
+        m.lc <= 8 && m.lp <= 4 && m.pb <= 4,
+        "method 'lzma': lc{} lp{} pb{} out of range",
+        m.lc,
+        m.lp,
+        m.pb
+    );
+    Ok(m)
+}
+
+/// Decodes FreeArc's `lzma` stream, then reads what's left of `input` so the
+/// stage feeding it isn't cut off.
+fn lzma(input: &mut dyn Read, out: &mut dyn Write, m: Lzma) -> io::Result<u64> {
+    let n = {
+        let mut r = lzma_rust2::LzmaReader::new(
+            io::BufReader::with_capacity(1 << 16, &mut *input),
+            u64::MAX,
+            m.lc,
+            m.lp,
+            m.pb,
+            m.dict,
+            None,
+        )?;
+        io::copy(&mut r, out)?
+    };
+    io::copy(input, &mut io::sink())?;
+    Ok(n)
 }
 
 /// FreeArc's memory sizes as methods write them: `8mb`, `512k`, `64m`, `1g`,
@@ -382,42 +486,17 @@ pub struct Decoders {
 }
 
 impl Decoders {
-    /// A CLS plug-in wins over arc.ini, as in FreeArc.
+    /// As FreeArc's `ParseCompressionMethod` does: the repack's own decoders
+    /// first, then the built-ins, which need no decoders folder.
     fn resolve(&self, name: &str, params: &str) -> Result<Decode> {
-        let dir = self
-            .dir
-            .as_ref()
-            .map_err(|why| anyhow::anyhow!("method '{name}' needs the repack's decoders: {why}"))?;
-        let ini = fs::read_to_string(dir.join("arc.ini")).unwrap_or_default();
-        if name == "4x4" {
-            // 4x4:<its options>:<inner method>[:<inner options>]
-            let mut parts = params.split(':');
-            let inner = parts
-                .by_ref()
-                .find(|p| {
-                    !(p.starts_with(['t', 'i', 'r', 'b'])
-                        && p[1..].starts_with(|c: char| c.is_ascii_digit()))
-                })
-                .context("4x4 without an inner method")?;
-            let rest: Vec<&str> = parts.collect();
-            let e = External::from_ini(&ini, dir, inner, &rest.join(":"))?.with_context(|| {
-                format!("4x4 around '{inner}': unrepack runs 4x4 only around arc.ini methods")
-            })?;
-            return Ok(Decode::FourByFour(e));
-        }
-        let p = dir.join(format!("cls-{name}.dll"));
-        if p.is_file() {
-            ensure!(
-                self.host.is_file(),
-                "the CLS host {} is missing",
-                self.host.display()
-            );
-            return Ok(Decode::Cls(p));
-        }
-        if let Some(e) = External::from_ini(&ini, dir, name, params)? {
-            return Ok(Decode::Ext(e));
+        if let Ok(dir) = &self.dir
+            && let Some(d) = self.repack_decoder(dir, name, params)?
+        {
+            return Ok(d);
         }
         match name {
+            "lzma" => return Ok(Decode::Lzma(lzma_params(params)?)),
+            "tor" => return Ok(Decode::Tornado),
             // Its block size and `x` only matter when compressing.
             "delta" => return Ok(Decode::Delta),
             "dispack" | "dispack070" => {
@@ -441,10 +520,46 @@ impl Decoders {
             !BUILT_IN.contains(&name),
             "method '{name}' is built into FreeArc itself; unrepack can't decode it yet"
         );
+        let dir = self
+            .dir
+            .as_ref()
+            .map_err(|why| anyhow::anyhow!("method '{name}' needs the repack's decoders: {why}"))?;
         bail!(
             "no decoder for method '{name}': neither cls-{name}.dll nor an arc.ini entry in {}",
             dir.display()
         )
+    }
+
+    /// A CLS plug-in, which wins over arc.ini as in FreeArc, or an arc.ini
+    /// entry (with `4x4` around one).
+    fn repack_decoder(&self, dir: &Path, name: &str, params: &str) -> Result<Option<Decode>> {
+        let ini = fs::read_to_string(dir.join("arc.ini")).unwrap_or_default();
+        if name == "4x4" {
+            // 4x4:<its options>:<inner method>[:<inner options>]
+            let mut parts = params.split(':');
+            let inner = parts
+                .by_ref()
+                .find(|p| {
+                    !(p.starts_with(['t', 'i', 'r', 'b'])
+                        && p[1..].starts_with(|c: char| c.is_ascii_digit()))
+                })
+                .context("4x4 without an inner method")?;
+            let rest: Vec<&str> = parts.collect();
+            let e = External::from_ini(&ini, dir, inner, &rest.join(":"))?.with_context(|| {
+                format!("4x4 around '{inner}': unrepack runs 4x4 only around arc.ini methods")
+            })?;
+            return Ok(Some(Decode::FourByFour(e)));
+        }
+        let p = dir.join(format!("cls-{name}.dll"));
+        if p.is_file() {
+            ensure!(
+                self.host.is_file(),
+                "the CLS host {} is missing",
+                self.host.display()
+            );
+            return Ok(Some(Decode::Cls(p)));
+        }
+        Ok(External::from_ini(&ini, dir, name, params)?.map(Decode::Ext))
     }
 
     /// Everything a block needs, checked before anything is touched.
@@ -565,6 +680,8 @@ impl Chain {
                             Decode::Dispack(block) => {
                                 crate::builtin::dispack(&mut input, &mut w, *block)
                             }
+                            Decode::Lzma(m) => lzma(&mut input, &mut w, *m),
+                            Decode::Tornado => crate::tornado::decode(&mut input, &mut w),
                             Decode::Cls(_) => unreachable!(),
                         };
                         if let Err(e) = &res {
@@ -995,6 +1112,176 @@ fn folder_size(dir: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn builtin(method: &str) -> Decode {
+        let dec = Decoders {
+            dir: Err("no decoders in this test".into()),
+            host: PathBuf::new(),
+            work: PathBuf::new(),
+        };
+        let (name, params) = method.split_once(':').unwrap_or((method, ""));
+        dec.resolve(name, params).unwrap()
+    }
+
+    fn lzma_of(method: &str) -> Lzma {
+        match builtin(method) {
+            Decode::Lzma(m) => m,
+            d => panic!("{method} resolved to {d:?}"),
+        }
+    }
+
+    #[test]
+    fn lzma_method_strings() {
+        // As FreeArc's ShowCompressionMethod prints them.
+        let m = |dict, lc, lp, pb| Lzma { dict, lc, lp, pb };
+        assert_eq!(
+            lzma_of("lzma:96mb:normal:bt4:128:mc256:lc8"),
+            m(96 << 20, 8, 0, 2)
+        );
+        assert_eq!(
+            lzma_of("lzma:1gb:max:bt4:273:pb0:lc1:lp2"),
+            m(1 << 30, 1, 2, 0)
+        );
+        assert_eq!(lzma_of("lzma:64mb:normal:32"), m(64 << 20, 3, 0, 2));
+        assert_eq!(lzma_of("lzma:1536kb:h4mb:a2:32"), m(1536 << 10, 3, 0, 2));
+        // Hand-written ones: a bare number is fast bytes, d is 2^n by default.
+        assert_eq!(lzma_of("lzma"), m(64 << 20, 3, 0, 2));
+        assert_eq!(lzma_of("lzma:d24:hc4:64"), m(16 << 20, 3, 0, 2));
+        assert_eq!(lzma_of("lzma:ultra:*zz"), m(64 << 20, 3, 0, 2));
+        assert!(matches!(builtin("tor:7:c3"), Decode::Tornado));
+        let dec = Decoders {
+            dir: Err("none".into()),
+            host: PathBuf::new(),
+            work: PathBuf::new(),
+        };
+        for bad in ["zz", "a", "lc9", "pb5", "d8gb"] {
+            assert!(dec.resolve("lzma", bad).is_err(), "{bad}");
+        }
+    }
+
+    /// liblzma's raw LZMA1 (testdata/README.md), decoded through `resolve`,
+    /// with junk after the end marker that must be read and dropped.
+    #[test]
+    fn lzma_decodes() {
+        for (file, method) in [
+            (
+                &include_bytes!("../testdata/lzma-default.bin")[..],
+                "lzma:1mb:normal:bt4:32",
+            ),
+            (
+                include_bytes!("../testdata/lzma-lc1lp2pb0.bin"),
+                "lzma:1mb:normal:32:pb0:lc1:lp2",
+            ),
+        ] {
+            let mut src = [file, &[9u8; 5000][..]].concat();
+            let mut input = &src[..];
+            let mut out = Vec::new();
+            let n = lzma(&mut input, &mut out, lzma_of(method)).unwrap();
+            assert!(input.is_empty());
+            assert_eq!((n, out.len()), (123616, 123616));
+            assert_eq!(crc32fast::hash(&out), 0x65d817f5);
+            // Cut short: an error, not a short success.
+            src.truncate(file.len() - 10);
+            assert!(lzma(&mut &src[..], &mut Vec::new(), lzma_of(method)).is_err());
+        }
+    }
+
+    /// A repack's own decoder for a method FreeArc also has built in wins,
+    /// as in FreeArc; without one, the built-in runs.
+    #[test]
+    fn repack_decoders_win_over_builtins() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("mylzma.exe"), b"").unwrap();
+        let ini = "[External compressor:lzma]\nheader = 0\nunpackcmd = mylzma d <stdin> <stdout>\n";
+        fs::write(dir.path().join("arc.ini"), ini).unwrap();
+        let dec = Decoders {
+            dir: Ok(dir.path().into()),
+            host: PathBuf::new(),
+            work: PathBuf::new(),
+        };
+        assert!(matches!(
+            dec.resolve("lzma", "96mb").unwrap(),
+            Decode::Ext(_)
+        ));
+        assert!(matches!(dec.resolve("tor", "5").unwrap(), Decode::Tornado));
+        assert!(matches!(dec.resolve("delta", "").unwrap(), Decode::Delta));
+        let err = dec.resolve("ppmd", "").unwrap_err().to_string();
+        assert!(err.contains("built into FreeArc"), "{err}");
+        assert!(dec.resolve("nosuch", "").is_err());
+    }
+
+    /// Both built-ins through the real stage chain: a data file with an
+    /// `lzma` block (two files) and a `tor` block (one), each cut by CRC.
+    #[test]
+    fn lzma_and_tor_blocks_extract() {
+        let lz = include_bytes!("../testdata/lzma-default.bin");
+        let tor = include_bytes!("../testdata/tor-c4opt.bin");
+        let mut want = Vec::new();
+        lzma(&mut &lz[..], &mut want, lzma_of("lzma:1mb")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data1.bin");
+        fs::write(&data, [&[0u8; 100][..], lz, tor].concat()).unwrap();
+        let entry = |name: &str, part: &[u8]| crate::freearc::Entry {
+            path: name.into(),
+            size: part.len() as u64,
+            crc: crc32fast::hash(part),
+            is_dir: false,
+        };
+        let blocks = [
+            Block {
+                method: "lzma:1mb:normal:bt4:32".into(),
+                start: 100,
+                packed: lz.len() as u64,
+                entries: vec![entry("a", &want[..50000]), entry("b", &want[50000..])],
+                crc: crate::freearc::Crc::Ieee,
+            },
+            Block {
+                method: "tor:5:c4".into(),
+                start: 100 + lz.len() as u64,
+                packed: tor.len() as u64,
+                entries: vec![entry("c", &want)],
+                crc: crate::freearc::Crc::Ieee,
+            },
+        ];
+        let dec = Decoders {
+            dir: Err("none".into()),
+            host: PathBuf::new(),
+            work: dir.path().join("work"),
+        };
+        let out = dir.path().join("out");
+        let file = File::open(&data).unwrap();
+        let mut p = Progress::new(3 * want.len() as u64);
+        for b in &blocks {
+            block(&data, &file, b, &dec, Some(&out), false, &mut p).unwrap();
+        }
+        assert!(fs::read(out.join("a")).unwrap() == want[..50000]);
+        assert!(fs::read(out.join("b")).unwrap() == want[50000..]);
+        assert!(fs::read(out.join("c")).unwrap() == want);
+    }
+
+    /// FreeArc often writes lc8, which liblzma can't make.
+    #[test]
+    fn lzma_lc8() {
+        let data = include_bytes!("../testdata/gen.py").repeat(200);
+        let opts = lzma_rust2::LzmaOptions {
+            lc: 8,
+            lp: 0,
+            pb: 2,
+            dict_size: 4 << 20,
+            ..lzma_rust2::LzmaOptions::with_preset(6)
+        };
+        let mut w = lzma_rust2::LzmaWriter::new_no_header(Vec::new(), &opts, true).unwrap();
+        w.write_all(&data).unwrap();
+        let packed = w.finish().unwrap();
+        let mut out = Vec::new();
+        lzma(
+            &mut &packed[..],
+            &mut out,
+            lzma_of("lzma:4mb:normal:bt4:32:lc8"),
+        )
+        .unwrap();
+        assert!(out == data);
+    }
 
     #[test]
     fn stages_decode_in_reverse() {

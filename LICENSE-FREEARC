@@ -1,13 +1,14 @@
-Licence notice for src/builtin.rs
-=================================
+Licence notice for src/builtin.rs and src/tornado.rs
+===================================================
 
-src/builtin.rs is NOT covered by unrepack's MIT OR Apache-2.0 licence. It is
-a Rust port of two decoders from the FreeArc 0.67 source
-(https://github.com/mrkaban/FreeArc-0.67, which mirrors Bulat Ziganshin's
-FreeArc), and it stays under the terms of that source.
+src/builtin.rs and src/tornado.rs are NOT covered by unrepack's MIT OR
+Apache-2.0 licence. They are Rust ports of decoders from the FreeArc 0.67
+source (https://github.com/mrkaban/FreeArc-0.67, which mirrors Bulat
+Ziganshin's FreeArc), and they stay under the terms of that source.
 
-1. delta (delta_decompress), from Compression/Delta/Delta.cpp,
-   (c) Bulat Ziganshin. Its header reads, verbatim:
+1. delta (delta_decompress), in src/builtin.rs, from
+   Compression/Delta/Delta.cpp, (c) Bulat Ziganshin. Its header reads,
+   verbatim:
 
      All rights reserved. You can for free use decompression part of the
      algorithm for decompression of FreeArc archives.
@@ -17,13 +18,26 @@ FreeArc), and it stays under the terms of that source.
    archives, which is all unrepack does with it. It is not open source.
    Any other use needs a licence from its author.
 
-2. dispack070 (DISPACK_METHOD::decompress and DisUnFilter), from
-   Compression/DisPack/C_DisPack.cpp and DisPack.cpp, Fabian Giesen's x86
-   filter as included in FreeArc. These files carry no licence line of their
-   own. The FreeArc tree they come from is distributed under the GNU General
-   Public License, version 2 (https://www.gnu.org/licenses/old-licenses/gpl-2.0.html).
+2. dispack070 (DISPACK_METHOD::decompress and DisUnFilter), in
+   src/builtin.rs, from Compression/DisPack/C_DisPack.cpp and DisPack.cpp,
+   Fabian Giesen's x86 filter as included in FreeArc. These files carry no
+   licence line of their own. The FreeArc tree they come from is distributed
+   under the GNU General Public License, version 2
+   (https://www.gnu.org/licenses/old-licenses/gpl-2.0.html).
+
+3. tor, Tornado (tor_decompress and its decoders), in src/tornado.rs, from
+   Compression/Tornado/Tornado.cpp, LZ77_Coder.cpp, EntropyCoder.cpp and
+   DataTables.cpp, (c) Bulat Ziganshin and Joachim Henke. Their headers read,
+   verbatim:
+
+     This code is provided on the GPL license.
+     If you need a commercial license to use the code, please write to
+     Bulat.Ziganshin@gmail.com
+
+   As part of the same GPL-2.0 tree, this port is under the GNU General
+   Public License, version 2.
 
 The opcode tables in src/builtin.rs were generated from that source.
 
-Building unrepack without src/builtin.rs leaves only MIT OR Apache-2.0 code.
-The repack's FitGirl bins that use delta or dispack070 then can't be decoded.
+Building unrepack without these two files leaves only MIT OR Apache-2.0 code.
+Repacks that use delta, dispack070 or tor then can't be decoded.
