@@ -229,6 +229,18 @@ fn list(path: &Path) -> Result<()> {
             human(b.unpacked()),
             b.entries.len()
         );
+        for e in &b.entries {
+            if e.is_dir {
+                say!("    {}\\", e.path.display());
+            } else {
+                say!(
+                    "    {}  {}  crc {:08x}",
+                    e.path.display(),
+                    human(e.size),
+                    e.crc
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -300,17 +312,22 @@ fn extract_cmd(a: Args) -> Result<()> {
     let dec = Decoders { dir, host, work };
 
     // Everything refusable is refused here, before anything changes.
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = std::collections::HashMap::new();
     for (f, arc) in &jobs {
         for b in &arc.blocks {
             dec.check(b).with_context(|| format!("{}", f.display()))?;
             for e in &b.entries {
                 let key = e.path.to_string_lossy().to_lowercase();
-                ensure!(
-                    seen.insert(key) || e.is_dir,
-                    "{} appears twice in the repack",
-                    e.path.display()
-                );
+                if let Some(first) = seen.insert(key, f).filter(|_| !e.is_dir) {
+                    bail!(
+                        "{} is in both {} and {}. These are usually optional parts, such as \
+                         language packs, that the installer lets you choose between; name the \
+                         data files you want instead of the folder",
+                        e.path.display(),
+                        first.file_name().unwrap_or_default().display(),
+                        f.file_name().unwrap_or_default().display()
+                    );
+                }
                 let t = out.join(&e.path);
                 ensure!(
                     e.is_dir || !t.exists(),
