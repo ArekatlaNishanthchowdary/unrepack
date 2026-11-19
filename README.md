@@ -156,7 +156,7 @@ No repack using `tor` or `lzma` has been tried yet. Archives made by FreeArc 0.6
 - **Built-in decoders don't trust the stream.** Where FreeArc's C code trusts sizes read from the data, the ports refuse bad ones.
 - **Decoders stay in their folder.** An `arc.ini` entry that names a program outside the decoders folder is refused.
 
-What it can't protect against in 0.1: with `--free-as-read`, a crash, a power cut, or a decoder failure after the first byte is freed loses the repack. That includes a decoder's own temp file hitting a full disk, which the measured check above is the only guard against. Use `--delete-each`, or keep the repack, when it can't be downloaded again.
+What it can't protect against yet: with `--free-as-read`, a crash, a power cut, or a decoder failure after the first byte is freed loses the repack. That includes a decoder's own temp file hitting a full disk, which the measured check above is the only guard against. Use `--delete-each`, or keep the repack, when it can't be downloaded again.
 
 ## How it works
 

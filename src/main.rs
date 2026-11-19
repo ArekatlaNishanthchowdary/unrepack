@@ -22,8 +22,10 @@ use anyhow::{Context, Result, bail, ensure};
 
 use extract::{Decoders, Job, Progress, human};
 
-const USAGE: &str = "\
-unrepack 0.1: extract FreeArc repack data files without running the installer
+const USAGE: &str = concat!(
+    "unrepack ",
+    env!("CARGO_PKG_VERSION"),
+    ": extract FreeArc repack data files without running the installer
 
 Usage:
   unrepack list <data file>
@@ -45,13 +47,14 @@ Options:
   --check           plan only: say whether it fits, change nothing
   --delete-each     delete each data file once all of it is extracted (crash safe)
   --free-as-read    free each data file's bytes as they are decoded. NOT crash safe in
-                    v0.1: if the run stops after the first freed byte, the repack is lost
+                    this version: if the run stops after the first freed byte, the repack is lost
   --no-verify       skip the decode-only pass that checks every CRC before anything is
                     freed or deleted (halves the time, removes the safety net)
   --yes             don't ask before freeing or deleting
 
 The repack's decoders are programs that came with the download; unrepack runs them.
-";
+"
+);
 
 struct Args {
     cmd: String,
