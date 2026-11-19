@@ -195,19 +195,51 @@ fn data_files(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
                 .filter_map(|e| e.ok().map(|e| e.path()))
                 .filter(|p| p.is_file() && freearc::sniff(p))
                 .collect();
-            found.sort_by_cached_key(|p| {
-                let n = p
-                    .file_name()
+            let name = |p: &Path| {
+                p.file_name()
                     .unwrap_or_default()
                     .to_string_lossy()
-                    .to_lowercase();
-                (kind(&n) != Kind::Required, n)
-            });
+                    .to_lowercase()
+            };
+            found.sort_by_cached_key(|p| order(&name(p)));
             ensure!(
                 !found.is_empty(),
                 "no FreeArc data files in {}",
                 p.display()
             );
+            // The required files come first, by prefix then number: each must
+            // follow the one before it, or the download is missing one. CRCs
+            // can't tell, as they only cover the files that are there.
+            // ponytail: a missing *last* file passes; the installer script's
+            // `{src}\dataN` list would catch it, add if one goes missing.
+            let mut last: Option<(&str, u64, &Path)> = None;
+            for f in &found {
+                let Some((pre, n)) = number(&name(f)) else {
+                    break;
+                };
+                let want = match last {
+                    Some((lp, ln, _)) if lp == pre => ln + 1,
+                    _ => 1,
+                };
+                // n < want: a second copy (data1.doi and data1.bin), or a 0.
+                ensure!(
+                    n <= want,
+                    "{} has no {pre}{want}{}: the download looks incomplete. Get the missing file(s) before extracting",
+                    p.display(),
+                    match last {
+                        Some((lp, _, lf)) if lp == pre => format!(
+                            " between {} and {}",
+                            lf.file_name().unwrap_or_default().to_string_lossy(),
+                            f.file_name().unwrap_or_default().to_string_lossy()
+                        ),
+                        _ => format!(
+                            " before {}",
+                            f.file_name().unwrap_or_default().to_string_lossy()
+                        ),
+                    }
+                );
+                last = Some((pre, n, f));
+            }
             out.extend(found);
         } else {
             ensure!(
@@ -288,17 +320,31 @@ fn language(name: &str) -> Option<&'static str> {
     LANGUAGES.iter().copied().find(|l| *l == first)
 }
 
-fn kind(name: &str) -> Kind {
+/// `data<N>` or `fg-<N>`: the prefix and N, which DODI leaves unpadded.
+fn number(name: &str) -> Option<(&'static str, u64)> {
     let stem = Path::new(name)
-        .file_stem()
-        .unwrap_or_default()
+        .file_stem()?
         .to_string_lossy()
         .to_lowercase();
-    let numbered = |p: &str| {
-        stem.strip_prefix(p)
-            .is_some_and(|r| !r.is_empty() && r.bytes().all(|c| c.is_ascii_digit()))
-    };
-    if numbered("data") || numbered("fg-") {
+    ["data", "fg-"].into_iter().find_map(|pre| {
+        let r = stem.strip_prefix(pre)?;
+        r.bytes()
+            .all(|c| c.is_ascii_digit())
+            .then(|| r.parse().ok())
+            .flatten()
+            .map(|n| (pre, n))
+    })
+}
+
+/// The installer's order: required files by number (data2 before data10),
+/// then the rest by name.
+fn order(name: &str) -> (bool, Option<(&'static str, u64)>, String) {
+    let n = number(name);
+    (n.is_none(), n, name.to_lowercase())
+}
+
+fn kind(name: &str) -> Kind {
+    if number(name).is_some() {
         Kind::Required
     } else if language(name).is_some() {
         Kind::Language
@@ -710,6 +756,29 @@ mod tests {
             assert_eq!(kind(n), k, "{n}");
         }
         assert_eq!(language("fg-selective-english.bin"), Some("english"));
+    }
+
+    #[test]
+    fn required_files_sort_by_number() {
+        let mut v = [
+            "English.doi",
+            "data10.doi",
+            "data2.doi",
+            "Data1.doi",
+            "artwork.doi",
+        ];
+        v.sort_by_key(|n| order(n));
+        assert_eq!(
+            v,
+            [
+                "Data1.doi",
+                "data2.doi",
+                "data10.doi",
+                "artwork.doi",
+                "English.doi"
+            ]
+        );
+        assert_eq!(number("fg-07.bin"), Some(("fg-", 7)));
     }
 
     #[test]

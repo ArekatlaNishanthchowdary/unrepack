@@ -572,3 +572,30 @@ fn list_and_check_work_on_a_folder() {
     let s = String::from_utf8_lossy(&o.stdout);
     assert!(s.contains("2 data file(s)") && s.contains("it fits"), "{s}");
 }
+
+/// A folder missing data2 is refused before anything is extracted or freed.
+#[test]
+fn a_gap_in_the_numbering_is_refused() {
+    let t = tempfile::tempdir().unwrap();
+    for n in ["data1.doi", "data3.doi"] {
+        write_archive(&t.path().join(n), "storing", &sample_files(), false);
+    }
+    let before = fs::read(t.path().join("data1.doi")).unwrap();
+    let out = t.path().join("out");
+    let o = unrepack(&[
+        "extract".as_ref(),
+        t.path().as_os_str(),
+        "-o".as_ref(),
+        out.as_os_str(),
+        "--yes".as_ref(),
+        "--free-as-read".as_ref(),
+    ]);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success());
+    assert!(
+        err.contains("no data2 between data1.doi and data3.doi"),
+        "{err}"
+    );
+    assert!(!out.exists());
+    assert_eq!(fs::read(t.path().join("data1.doi")).unwrap(), before);
+}
