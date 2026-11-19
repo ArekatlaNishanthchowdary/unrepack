@@ -1,28 +1,39 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/logo-dark.svg">
+    <img src="docs/logo-light.svg" width="400" alt="unrepack logo: a green tile with three white layers, the top one lifting off">
+  </picture>
+</p>
+
 <h1 align="center">unrepack</h1>
+
+<h3 align="center">Unpack game repacks without their installer</h3>
+
+<p align="center">
+  <a href="https://github.com/ArekatlaNishanthchowdary/unrepack/releases/latest"><img src="https://img.shields.io/github/v/release/ArekatlaNishanthchowdary/unrepack?style=for-the-badge&label=release&color=1f6feb" alt="Latest release" /></a>
+  <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-e8743b?style=for-the-badge" alt="MIT or Apache-2.0 licensed, except src/builtin.rs and src/tornado.rs" /></a>
+  <a href="https://github.com/ArekatlaNishanthchowdary/unrepack/releases"><img src="https://img.shields.io/github/downloads/ArekatlaNishanthchowdary/unrepack/total?style=for-the-badge&label=downloads&color=3fb950" alt="Downloads" /></a>
+  <a href="https://github.com/ArekatlaNishanthchowdary/unrepack/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/ArekatlaNishanthchowdary/unrepack/ci.yml?branch=master&style=for-the-badge&label=ci" alt="CI status" /></a>
+  <img src="https://img.shields.io/badge/platform-windows-4ca571?style=for-the-badge" alt="Windows only" />
+</p>
+
+<h4 align="center">
+  <a href="https://github.com/ArekatlaNishanthchowdary/unrepack/releases/latest">Download</a> ·
+  <a href="#usage">Usage</a> ·
+  <a href="#status">Status</a> ·
+  <a href="#is-unrepack-safe">Safety</a> ·
+  <a href="#how-it-works">How it works</a> ·
+  <a href="#build-and-test">Build</a> ·
+  <a href="#license">License</a>
+</h4>
 
 <p align="center">
   <img src="docs/intro.gif" width="960" alt="A repack's data file, drawn as a stack of grey layers, peels away one layer at a time; each layer unpacks into files that stack up as the game, while a drive-usage bar grows only to the game's size and never reaches the repack-plus-game line an installer would need.">
 </p>
 
 <p align="center">
-  Unpack FreeArc game repacks without running their installer.<br>
   The repack can give its space back while it is read, so the repack and the game<br>
   never have to fit on the disk <em>together</em>.
-</p>
-
-<h4 align="center">
-  <a href="#usage">Usage</a> |
-  <a href="#status">Status</a> |
-  <a href="#is-unrepack-safe">Safety</a> |
-  <a href="#how-it-works">How it works</a> |
-  <a href="#build-and-test">Build</a> |
-  <a href="#license">License</a>
-</h4>
-
-<p align="center">
-  <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" alt="MIT or Apache-2.0 licensed, except src/builtin.rs and src/tornado.rs" /></a>
-  <img src="https://img.shields.io/badge/platform-windows-blue.svg" alt="Windows only" />
-  <img src="https://img.shields.io/badge/version-0.1-orange.svg" alt="Version 0.1" />
 </p>
 
 unrepack is a free, open-source app and command line tool for Windows. It extracts the data files of game repacks built on FreeArc, such as DODI and FitGirl repacks, straight into a game folder. It checks every file's CRC as it goes. It does not run the installer, so there is no installer UI, registry editing or redistributable setup.
