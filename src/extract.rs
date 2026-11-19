@@ -48,10 +48,11 @@ enum Decode {
     Cls(PathBuf),
     /// An `[External compressor]` from the repack's arc.ini.
     Ext(External),
-    /// FreeArc's `4x4`: a 4-byte stream header (0), then frames of unpacked
-    /// size, packed size (u32 LE each) and the packed bytes, each frame
-    /// decoded on its own by the inner method.
-    FourByFour(External),
+    /// FreeArc's `4x4` (C_4x4.cpp): a 4-byte stream header (0), then frames
+    /// of unpacked size, packed size (u32 LE each) and the packed bytes, each
+    /// frame decoded on its own by the inner method; an unpacked size of
+    /// 0xFFFFFFFF marks a frame stored as is.
+    FourByFour(Box<Decode>),
     /// FreeArc built-ins ported in `builtin.rs`.
     Delta,
     /// `dispack070`, with its block size.
@@ -366,45 +367,71 @@ impl External {
         fs::remove_file(&d)?;
         Ok(n)
     }
+}
 
-    /// `4x4` around this method. ponytail: one frame at a time; FreeArc
-    /// decodes frames on several threads, add that if this is the slow stage.
-    fn four_by_four(
+impl Decode {
+    /// Decodes everything `input` gives into `out` on this thread, in folder
+    /// `dir`. CLS plug-ins run as processes in [`Chain::start`] instead.
+    fn run(
         &self,
         input: &mut (dyn Read + Send),
         dir: &Path,
         out: &mut dyn Write,
     ) -> io::Result<u64> {
-        let bad = |m: String| io::Error::new(io::ErrorKind::InvalidData, format!("4x4: {m}"));
-        let mut h = [0u8; 4];
-        input.read_exact(&mut h)?;
-        if h != [0; 4] {
-            return Err(bad(format!("stream header {h:02x?} not understood")));
+        match self {
+            Decode::FourByFour(inner) => four_by_four(inner, input, dir, out),
+            Decode::Ext(e) => e.run_once(input, dir, out),
+            Decode::Delta => crate::builtin::delta(input, out),
+            Decode::Dispack(block) => crate::builtin::dispack(input, out, *block),
+            Decode::Lzma(m) => lzma(input, out, *m),
+            Decode::Tornado => crate::tornado::decode(input, out),
+            Decode::Cls(_) => unreachable!("resolve keeps CLS out of 4x4"),
         }
-        let mut total = 0;
-        loop {
-            let mut f = [0u8; 8];
-            let got = read_full(input, &mut f)?;
-            if got == 0 {
-                return Ok(total);
-            }
-            if got < 8 {
-                return Err(bad("stream ends inside a frame header".into()));
-            }
-            let size = u64::from(u32::from_le_bytes(f[..4].try_into().unwrap()));
-            let packed = u64::from(u32::from_le_bytes(f[4..].try_into().unwrap()));
-            let mut frame = (&mut *input).take(packed);
-            let n = self.run_once(&mut frame, dir, out)?;
-            if frame.limit() != 0 {
-                return Err(bad("stream ends inside a frame".into()));
-            }
-            if n != size {
-                return Err(bad(format!(
-                    "frame decoded to {n} bytes, its header says {size}"
-                )));
-            }
-            total += n;
+    }
+}
+
+/// `4x4` around `inner`. ponytail: one frame at a time; FreeArc decodes
+/// frames on several threads, add that if this is the slow stage.
+fn four_by_four(
+    inner: &Decode,
+    input: &mut (dyn Read + Send),
+    dir: &Path,
+    out: &mut dyn Write,
+) -> io::Result<u64> {
+    let bad = |m: String| io::Error::new(io::ErrorKind::InvalidData, format!("4x4: {m}"));
+    let mut h = [0u8; 4];
+    match read_full(input, &mut h)? {
+        0 => return Ok(0),
+        4 if h == [0; 4] => {}
+        _ => return Err(bad(format!("stream header {h:02x?} not understood"))),
+    }
+    let mut total = 0;
+    loop {
+        let mut f = [0u8; 8];
+        let got = read_full(input, &mut f)?;
+        if got == 0 {
+            return Ok(total);
         }
+        if got < 8 {
+            return Err(bad("stream ends inside a frame header".into()));
+        }
+        let size = u32::from_le_bytes(f[..4].try_into().unwrap());
+        let packed = u64::from(u32::from_le_bytes(f[4..].try_into().unwrap()));
+        let mut frame = (&mut *input).take(packed);
+        let (n, size) = if size == u32::MAX {
+            (io::copy(&mut frame, out)?, packed)
+        } else {
+            (inner.run(&mut frame, dir, out)?, u64::from(size))
+        };
+        if frame.limit() != 0 {
+            return Err(bad("stream ends inside a frame".into()));
+        }
+        if n != size {
+            return Err(bad(format!(
+                "frame decoded to {n} bytes, its header says {size}"
+            )));
+        }
+        total += n;
     }
 }
 
@@ -489,6 +516,22 @@ impl Decoders {
     /// As FreeArc's `ParseCompressionMethod` does: the repack's own decoders
     /// first, then the built-ins, which need no decoders folder.
     fn resolve(&self, name: &str, params: &str) -> Result<Decode> {
+        if name == "4x4" {
+            // 4x4[:b<size>:t<n>:i<n>:r<pct>]:<inner method>[:<its options>];
+            // as parse_4x4, an option has a digit first or second.
+            let mut parts = params.split(':');
+            let inner = parts
+                .by_ref()
+                .find(|p| !p.bytes().take(2).any(|c| c.is_ascii_digit()))
+                .context("4x4 without an inner method")?;
+            let rest: Vec<&str> = parts.collect();
+            let d = self.resolve(inner, &rest.join(":"))?;
+            ensure!(
+                !matches!(d, Decode::Cls(_) | Decode::FourByFour(_)),
+                "4x4 around '{inner}': not supported"
+            );
+            return Ok(Decode::FourByFour(Box::new(d)));
+        }
         if let Ok(dir) = &self.dir
             && let Some(d) = self.repack_decoder(dir, name, params)?
         {
@@ -531,25 +574,9 @@ impl Decoders {
     }
 
     /// A CLS plug-in, which wins over arc.ini as in FreeArc, or an arc.ini
-    /// entry (with `4x4` around one).
+    /// entry.
     fn repack_decoder(&self, dir: &Path, name: &str, params: &str) -> Result<Option<Decode>> {
         let ini = fs::read_to_string(dir.join("arc.ini")).unwrap_or_default();
-        if name == "4x4" {
-            // 4x4:<its options>:<inner method>[:<inner options>]
-            let mut parts = params.split(':');
-            let inner = parts
-                .by_ref()
-                .find(|p| {
-                    !(p.starts_with(['t', 'i', 'r', 'b'])
-                        && p[1..].starts_with(|c: char| c.is_ascii_digit()))
-                })
-                .context("4x4 without an inner method")?;
-            let rest: Vec<&str> = parts.collect();
-            let e = External::from_ini(&ini, dir, inner, &rest.join(":"))?.with_context(|| {
-                format!("4x4 around '{inner}': unrepack runs 4x4 only around arc.ini methods")
-            })?;
-            return Ok(Some(Decode::FourByFour(e)));
-        }
         let p = dir.join(format!("cls-{name}.dll"));
         if p.is_file() {
             ensure!(
@@ -673,17 +700,7 @@ impl Chain {
                     let mut input = out;
                     out = dump(Box::new(r), k, &name)?;
                     pumps.push(std::thread::spawn(move || {
-                        let res = match &d {
-                            Decode::FourByFour(e) => e.four_by_four(&mut input, &dir, &mut w),
-                            Decode::Ext(e) => e.run_once(&mut input, &dir, &mut w),
-                            Decode::Delta => crate::builtin::delta(&mut input, &mut w),
-                            Decode::Dispack(block) => {
-                                crate::builtin::dispack(&mut input, &mut w, *block)
-                            }
-                            Decode::Lzma(m) => lzma(&mut input, &mut w, *m),
-                            Decode::Tornado => crate::tornado::decode(&mut input, &mut w),
-                            Decode::Cls(_) => unreachable!(),
-                        };
+                        let res = d.run(&mut input, &dir, &mut w);
                         if let Err(e) = &res {
                             crate::log::line(&format!("decoder '{name}': {e}"), true);
                             win::stop_decoders();
@@ -1259,6 +1276,39 @@ mod tests {
         assert!(fs::read(out.join("c")).unwrap() == want);
     }
 
+    /// `4x4` around the built-ins, on streams cut from archives FreeArc 0.67's
+    /// Arc.exe made: 6 frames each, 2 of them stored.
+    #[test]
+    fn four_by_four_builtins() {
+        let dec = Decoders {
+            dir: Err("none".into()),
+            host: PathBuf::new(),
+            work: PathBuf::new(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        for (params, s) in [
+            (
+                "b32kb:tor:3:188kb",
+                &include_bytes!("../testdata/4x4-tor.bin")[..],
+            ),
+            (
+                "b32kb:lzma:188kb:fast:32",
+                include_bytes!("../testdata/4x4-lzma.bin"),
+            ),
+        ] {
+            let d = dec.resolve("4x4", params).unwrap();
+            let mut out = Vec::new();
+            d.run(&mut &s[..], dir.path(), &mut out).unwrap();
+            assert_eq!(
+                (out.len(), crc32fast::hash(&out)),
+                (189152, 0x9815b9f8),
+                "{params}"
+            );
+        }
+        let err = dec.resolve("4x4", "b7mb:ppmd:8").unwrap_err().to_string();
+        assert!(err.contains("built into FreeArc"), "{err}");
+    }
+
     /// FreeArc often writes lc8, which liblzma can't make.
     #[test]
     fn lzma_lc8() {
@@ -1386,25 +1436,22 @@ mod tests {
             v.extend(b);
             v
         };
+        let copy = Decode::Ext(copy);
+        let run = |s: &[u8]| {
+            let mut out = Vec::new();
+            four_by_four(&copy, &mut &s[..], dir.path(), &mut out).map(|n| (n, out))
+        };
         let mut s = vec![0u8; 4];
         s.extend(frame(b"hello ", 6));
+        s.extend(frame(b"big ", u32::MAX)); // stored, not run through `copy`
         s.extend(frame(b"world", 5));
-        let mut out = Vec::new();
-        let n = copy
-            .four_by_four(&mut &s[..], dir.path(), &mut out)
-            .unwrap();
-        assert_eq!((n, &out[..]), (11, &b"hello world"[..]));
+        assert_eq!(run(&s).unwrap(), (15, b"hello big world".to_vec()));
 
         let mut bad = vec![0u8; 4];
         bad.extend(frame(b"hello", 9));
-        assert!(
-            copy.four_by_four(&mut &bad[..], dir.path(), &mut Vec::new())
-                .is_err()
-        );
-        let cut = &s[..s.len() - 2];
-        assert!(
-            copy.four_by_four(&mut &cut[..], dir.path(), &mut Vec::new())
-                .is_err()
-        );
+        assert!(run(&bad).is_err());
+        assert!(run(&s[..s.len() - 2]).is_err());
+        assert!(run(&[1, 0, 0, 0]).is_err(), "version 1");
+        assert_eq!(run(&[]).unwrap().0, 0);
     }
 }

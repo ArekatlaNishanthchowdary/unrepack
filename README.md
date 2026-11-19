@@ -100,14 +100,17 @@ Every result below was run on real repacks. "Every CRC matching" means each file
 
 FitGirl's own MD5 lists name 14,011 game files, and 4,210 of them match the output byte for byte. The other 9,800 are RPG Maker MV images and audio that the repack stores unencrypted, and its installer encrypts them afterwards. One file, a title movie, ships inside `Setup.exe` rather than in any data file.
 
+No repack using `tor` or `lzma` has been tried yet. Archives made by FreeArc 0.67's own `Arc.exe` from 137 MB of game files, programs and text extract with every CRC matching. That covers `tor:1` to `tor:11`, `lzma` fast, normal and max, and `4x4` around both, including frames 4x4 stored because they didn't compress. FreeArc's `-m1` to `-m9` presets also use `rep`, `exe`, `grzip` or `ppmd`, so archives made with them are still refused.
+
 | Part | State |
 |---|---|
 | FreeArc directory, footer and CRCs | Works |
 | CLS plug-ins (`cls-*.dll`) through the 32-bit host | Works |
-| External decoders from `arc.ini`, and `4x4` around them | Works |
+| External decoders from `arc.ini` | Works |
 | FreeArc built-ins `delta`, `dispack070` and `tor` (Tornado) | Works, ported natively |
 | FreeArc built-in `lzma` | Works, through the `lzma-rust2` crate |
-| Other FreeArc built-ins (`ppmd`, `rep`, `exe`, `lzma2`, …), and `4x4` around a built-in | Not yet: refused before anything is changed |
+| `4x4` around an external decoder or a built-in above | Works |
+| Other FreeArc built-ins (`ppmd`, `rep`, `exe`, `lzma2`, …), and `4x4` around a CLS plug-in | Not yet: refused before anything is changed |
 | Resume after a crash | Not in 0.1 |
 | Installer steps (registry, redistributables, language choice, post-install patches such as FitGirl's RTPatch `.x3` files and `restore-duplicates.bat`) | Not done. Only the files inside the data files are extracted |
 
@@ -145,7 +148,7 @@ gcc -m32 -O2 -s -static -o target/release/unrepack-clshost.exe clshost/clshost.c
 cargo test --release
 ```
 
-`cargo build --release` builds both `unrepack.exe` and the app, `unrepack-gui.exe` (egui, a single native exe). The tests write FreeArc archives in the layout measured from real repacks and run the binary on them. They use `storing`, `copy`, and a CLS codec built from `clshost/test_copy.c`, so the host process runs as it does with a repack's decoders. `delta` and `dispack070` are tested on hand-built streams. `tor` and `lzma` are tested on streams made by FreeArc 0.67's own Tornado compressor and by liblzma (see [testdata/README.md](testdata/README.md)). `UNREPACK_SAMPLE=<data file> cargo test real_sample` also parses a real data file, and `UNREPACK_DUMP=<dir>` saves every stage's output for debugging.
+`cargo build --release` builds both `unrepack.exe` and the app, `unrepack-gui.exe` (egui, a single native exe). The tests write FreeArc archives in the layout measured from real repacks and run the binary on them. They use `storing`, `copy`, and a CLS codec built from `clshost/test_copy.c`, so the host process runs as it does with a repack's decoders. `delta` and `dispack070` are tested on hand-built streams. `tor` and `lzma` are tested on streams made by FreeArc 0.67's own Tornado compressor and by liblzma, and `4x4` around them on streams cut from archives FreeArc 0.67's `Arc.exe` made (see [testdata/README.md](testdata/README.md)). `UNREPACK_SAMPLE=<data file> cargo test real_sample` also parses a real data file, and `UNREPACK_DUMP=<dir>` saves every stage's output for debugging.
 
 ## License
 
