@@ -13,6 +13,7 @@
   <a href="https://github.com/ArekatlaNishanthchowdary/unrepack/releases/latest"><img src="https://img.shields.io/github/v/release/ArekatlaNishanthchowdary/unrepack?style=for-the-badge&label=release&color=1f6feb" alt="Latest release" /></a>
   <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-e8743b?style=for-the-badge" alt="MIT or Apache-2.0 licensed, except src/builtin.rs and src/tornado.rs" /></a>
   <a href="https://github.com/ArekatlaNishanthchowdary/unrepack/releases"><img src="https://img.shields.io/github/downloads/ArekatlaNishanthchowdary/unrepack/total?style=for-the-badge&label=downloads&color=3fb950" alt="Downloads" /></a>
+  <a href="#sponsor"><img src="https://img.shields.io/badge/sponsor-UPI-ea4aaa?style=for-the-badge&logo=githubsponsors&logoColor=white" alt="Sponsor over UPI" /></a>
   <a href="https://github.com/ArekatlaNishanthchowdary/unrepack/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/ArekatlaNishanthchowdary/unrepack/ci.yml?branch=master&style=for-the-badge&label=ci" alt="CI status" /></a>
   <img src="https://img.shields.io/badge/platform-windows-4ca571?style=for-the-badge" alt="Windows only" />
 </p>
@@ -24,7 +25,8 @@
   <a href="#is-unrepack-safe">Safety</a> ·
   <a href="#how-it-works">How it works</a> ·
   <a href="#build-and-test">Build</a> ·
-  <a href="#license">License</a>
+  <a href="#license">License</a> ·
+  <a href="#sponsor">Sponsor</a>
 </h4>
 
 <p align="center">
@@ -179,6 +181,14 @@ cargo test --release
 ```
 
 `cargo build --release` builds both `unrepack.exe` and the app, `unrepack-gui.exe` (egui, a single native exe). The tests write FreeArc archives in the layout measured from real repacks and run the binary on them. They use `storing`, `copy`, and a CLS codec built from `clshost/test_copy.c`, so the host process runs as it does with a repack's decoders. `delta` and `dispack070` are tested on hand-built streams. `tor` and `lzma` are tested on streams made by FreeArc 0.67's own Tornado compressor and by liblzma, and `4x4` around them on streams cut from archives FreeArc 0.67's `Arc.exe` made (see [testdata/README.md](testdata/README.md)). `UNREPACK_SAMPLE=<data file> cargo test real_sample` also parses a real data file, and `UNREPACK_DUMP=<dir>` saves every stage's output for debugging.
+
+## Sponsor
+
+If unrepack saved you a download or some disk space, you can support it over UPI: scan the code with any UPI app, or pay `nishanthchowdary1234@pingpay`.
+
+<p align="center">
+  <img src="docs/upi-qr.png" width="240" alt="UPI QR code for nishanthchowdary1234@pingpay">
+</p>
 
 ## License
 
