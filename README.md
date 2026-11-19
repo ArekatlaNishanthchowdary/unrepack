@@ -121,16 +121,12 @@ No repack using `tor` or `lzma` has been tried yet. Archives made by FreeArc 0.6
 
 | Part | State |
 |---|---|
-| FreeArc directory, footer and CRCs | Works |
-| CLS plug-ins (`cls-*.dll`) through the 32-bit host | Works |
-| External decoders from `arc.ini` | Works |
-| FreeArc built-ins `delta`, `dispack070` and `tor` (Tornado) | Works, ported natively |
-| FreeArc built-in `lzma` | Works, through the `lzma-rust2` crate |
-| `4x4` around an external decoder or a built-in above | Works |
-| Other FreeArc built-ins (`ppmd`, `rep`, `exe`, `lzma2`, …), and `4x4` around a CLS plug-in | Not yet: refused before anything is changed |
-| Resume after a crash | Not in 0.1 |
-| Choosing languages and extras | Works, by data file name: `unrepack parts`, and tick boxes in the app |
-| Installer steps (registry, redistributables, post-install patches such as FitGirl's RTPatch `.x3` files and `restore-duplicates.bat`) | Not done. Only the files inside the data files are extracted |
+| FreeArc archives and CRCs, CLS plug-ins (`cls-*.dll`), `arc.ini` decoders | Works |
+| Built-ins `lzma`, `tor`, `delta`, `dispack070`, and `4x4` around them or an `arc.ini` decoder | Works |
+| Choosing languages and extras | Works, by data file name |
+| Other built-ins (`ppmd`, `rep`, `exe`, `lzma2`, …), `4x4` around a CLS plug-in | Refused before anything changes |
+| Resume after a crash | Not yet |
+| Installer steps (registry, redistributables, post-install patches) | Not done: only the data files' contents are extracted |
 
 ## Is unrepack safe
 
