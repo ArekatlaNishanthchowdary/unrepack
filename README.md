@@ -42,6 +42,10 @@ A repack's installer needs room for the repack **and** the whole game at once. C
 
 ## Usage
 
+### Download
+
+Get `unrepack-<version>-windows-x64.zip` from [the latest release](https://github.com/ArekatlaNishanthchowdary/unrepack/releases/latest) and unzip it anywhere. It holds the ready-to-run programs, `unrepack-gui.exe`, `unrepack.exe` and `unrepack-clshost.exe`, so you don't need the source code or Rust. The `.sha256` file next to it is the zip's SHA-256, to check the download with `Get-FileHash <zip>` in PowerShell.
+
 ### The app
 
 Run `unrepack-gui.exe` as administrator; the repacks' decoders don't work without it. Pick the repack folder and where to install. If the repack offers languages or extras (movies, artwork, soundtracks), tick the ones you want, as in the installer: English starts ticked and the other languages don't. The decoders are read out of the repack's `Setup.exe`, so their folder can stay empty. Then choose what happens to the repack and press **Check space** or **Unpack**. The app runs `unrepack.exe` next to it and shows its progress and log, so it does exactly what the command line does, with the same checks. It asks before any mode that deletes or frees the repack, and before stopping a run that would lose it.
@@ -166,7 +170,7 @@ The last stage's output is cut into files, and each file's CRC is checked. With 
 
 ## Build and test
 
-Windows, with [Rust](https://rustup.rs) and a 32-bit MinGW `gcc` for the CLS host:
+Only needed to change unrepack; to use it, [download](#download) the zip. Windows, with [Rust](https://rustup.rs) and a 32-bit MinGW `gcc` for the CLS host:
 
 ```bash
 cargo build --release
