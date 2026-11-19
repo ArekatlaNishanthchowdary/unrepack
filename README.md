@@ -36,7 +36,7 @@
   never have to fit on the disk <em>together</em>.
 </p>
 
-unrepack is a free, open-source app and command line tool for Windows. It extracts the data files of game repacks built on FreeArc, such as DODI and FitGirl repacks, straight into a game folder. It checks every file's CRC as it goes. It does not run the installer, so there is no installer UI, registry editing or redistributable setup.
+unrepack is a free, open-source app and command line tool for Windows. It extracts the data files of game repacks built on FreeArc, such as DODI and FitGirl repacks, straight into a game folder. It checks every file's CRC as it goes. It does not run the installer, so there is no installer UI, registry editing or redistributable setup. When the installer does more than unpack, such as rebuilding game files from pieces afterwards, unrepack reads those steps from the installer's script and follows them (see [Setup's install steps](#setups-install-steps)).
 
 A repack's installer needs room for the repack **and** the whole game at once. Crusader Kings III [DODI Repack] is 6.05 GB packed and 19.87 GB installed, so it needs about 26 GB of disk. With `--free-as-read`, unrepack needs 13.94 GB. It gives each data file's bytes back to the disk as soon as they are decoded, so the space the repack frees holds the game files that follow.
 
@@ -77,7 +77,17 @@ Repacks put each language and each extra in a data file of its own, and the inst
 unrepack extract "Game [DODI Repack]\data1.doi" "Game [DODI Repack]\data2.doi" "Game [DODI Repack]\English.doi" -o "D:\Games\Game"
 ```
 
-Language packs often hold the same file, such as `sound\desktop.ini`. As with the installer, the copy from the data file named later is kept, and unrepack says which. The sorting goes by file names alone. The installer's own choices and defaults are in its compiled script, which unrepack doesn't read.
+Language packs often hold the same file, such as `sound\desktop.ini`. As with the installer, the copy from the data file named later is kept, and unrepack says which. The sorting goes by file names alone. The installer's own choices and defaults are in its compiled script, which unrepack reads only for its install steps.
+
+### Setup's install steps
+
+Some repacks need more than unpacking. A FitGirl installer can unpack its own tools first, extract the data files in an order of its choosing, then run commands that rebuild game files from stored pieces, edit `.ini` files and delete what's left. unrepack reads those steps out of the compiled script in `Setup.exe` (Inno Setup 5.5) and does them in Setup's order. When the script only unpacks the data files, unrepack extracts them by name as usual.
+
+- **Commands run as Setup runs them**, in the game folder or Setup's temp folder, and their output goes to the log. A non-zero exit code is logged, not fatal, because Setup ignores it too: FitGirl's batch scripts delete themselves as their last line, which `cmd` reports as an error.
+- **Each rebuilt file must exist afterwards.** Setup names the file each rebuild step makes. If one is missing when the steps finish, the run fails and says the game folder is incomplete.
+- **Setup's own files go in the game folder**, for the components being installed only: FitGirl's `_Redist` folder with its MD5 list and one hash list per language. If one of them has the same name as a file in the data files, unrepack refuses to run rather than guess.
+- **Steps behind a wizard checkbox are left out**, such as low-RAM modes. So are registry entries and redistributables.
+- **A script unrepack can't follow is refused before anything changes**: a program started through `Exec2`, or files unpacked somewhere other than the game or temp folder. A `Setup.exe` that can't be read at all, usually because an antivirus blocked it, is refused too, because extracting by name would quietly skip the rebuild.
 
 The repack's own decoders are needed too: `cls-*.dll` plug-ins, their `cls-*_x64.exe` / `cls-*_x86.exe` helpers, `cls.ini`, and `arc.ini` with any external decoders it names (FitGirl's `rzw.exe`, for example). unrepack reads them out of the repack's `Setup.exe` (Inno Setup 5.5, as DODI and FitGirl use) into a temporary folder, the way the installer would put them in `{tmp}`, without running anything in it. Every file is checked against the SHA-1 the installer stores, Inno's CALL/JMP filter is undone, and `{app}` / `{tmp}` in the `.ini` files become the decoders' working folder. The folder is removed when the run ends. `--decoders <folder>` uses a folder of decoders instead, and so does a repack folder that already holds them. Antivirus programs often flag a repack's `Setup.exe` (Windows Defender removed FitGirl's as `HackTool:Win32/Crack!MTB` when unrepack opened it); without it, unrepack says so and needs `--decoders`.
 
@@ -114,8 +124,9 @@ Tested on real repacks. Every file's CRC-32 matched the one stored in the archiv
 |---|---|---|
 | Crusader Kings III (DODI), 2 data files | `cls-lolz` + `cls-srep` | 52,644 files, 19.9 GB, about 6 min |
 | A FitGirl repack, 6 data files | `srep`, `magic2`, `mpzz`, `xt2png`, `dispack070`, `delta`, `4x4:rzw` | 14,015 files, 5.0 GB |
+| A FitGirl repack with rebuild steps, 9 data files, English voice | `magic2` and others, then Setup's xtool and builder steps | 5,113 files, 88.1 GB, about 52 min |
 
-Freeing the repack while reading it gave the same files as keeping it. Against FitGirl's MD5 list, 4,210 of 14,011 files match byte for byte: the rest are images and audio its installer encrypts after unpacking, plus one movie inside `Setup.exe`.
+Freeing the repack while reading it gave the same files as keeping it. Against FitGirl's MD5 list, 4,210 of 14,011 files of the first FitGirl repack match byte for byte: the rest are images and audio its installer encrypts after unpacking, plus one movie inside `Setup.exe`. That run was before unrepack followed Setup's steps. The repack with rebuild steps, installed by following them, matches FitGirl's MD5 list in every one of its 5,113 files.
 
 No repack using `tor` or `lzma` has been tried yet. Archives made by FreeArc 0.67's own `Arc.exe` from 137 MB of game files, programs and text extract with every CRC matching. That covers `tor:1` to `tor:11`, `lzma` fast, normal and max, and `4x4` around both, including frames 4x4 stored because they didn't compress. FreeArc's `-m1` to `-m9` presets also use `rep`, `exe`, `grzip` or `ppmd`, so archives made with them are still refused.
 
@@ -126,12 +137,13 @@ No repack using `tor` or `lzma` has been tried yet. Archives made by FreeArc 0.6
 | Choosing languages and extras | Works, by data file name |
 | Other built-ins (`ppmd`, `rep`, `exe`, `lzma2`, …), `4x4` around a CLS plug-in | Refused before anything changes |
 | Resume after a crash | Not yet |
-| Installer steps (registry, redistributables, post-install patches) | Not done: only the data files' contents are extracted |
+| Setup's install steps: tool archives, data file order, rebuild commands, `.ini` edits, deletes | Works, for Inno Setup 5.5 installers |
+| Registry entries, redistributables, steps behind a wizard checkbox | Not done |
 
 ## Is unrepack safe
 
 > [!WARNING]
-> **unrepack runs the decoders that came with the download.** A repack's `cls-*.dll`, its helper `.exe` files and the programs `arc.ini` names are programs from the download. Use repacks you trust.
+> **unrepack runs the decoders that came with the download.** A repack's `cls-*.dll`, its helper `.exe` files and the programs `arc.ini` names are programs from the download. So are the tools and batch scripts that Setup's install steps run. Use repacks you trust.
 
 - **Nothing is freed until the whole repack decodes.** Before `--free-as-read` or `--delete-each` changes anything, a verify pass decodes every data file and checks every file's CRC. That pass also measures the decoders' temp files and how far the output runs ahead of the input, and checks the free space again with those numbers. `--no-verify` skips it.
 - **A full disk pauses the run instead of ending it.**
