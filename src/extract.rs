@@ -602,6 +602,11 @@ impl Decoders {
                 "the CLS host {} is missing",
                 self.host.display()
             );
+            ensure!(
+                unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() } != 0 || !needs_admin(&p),
+                "the '{name}' decoder needs administrator rights (Windows lets only those create its \
+                 shared memory); run unrepack from a window opened with Run as administrator"
+            );
             return Ok(Some(Decode::Cls(p)));
         }
         Ok(External::from_ini(&ini, dir, name, params, &self.pending)?.map(Decode::Ext))
@@ -616,6 +621,17 @@ impl Decoders {
         }
         Ok(())
     }
+}
+
+/// Whether a CLS plug-in or its 64-bit helper names shared memory under
+/// `Global\`, which only an elevated process may create (FitGirl's srep and
+/// magic2 do; the installer always runs elevated).
+fn needs_admin(dll: &Path) -> bool {
+    let stem = dll.file_stem().unwrap_or_default().to_string_lossy();
+    let x64 = dll.with_file_name(format!("{stem}_x64.exe"));
+    [dll, &x64]
+        .iter()
+        .any(|p| fs::read(p).is_ok_and(|b| b.windows(7).any(|w| w == b"Global\\")))
 }
 
 /// Reads one block's packed bytes in order, freeing them behind itself when
@@ -1385,6 +1401,21 @@ mod tests {
             ]
         );
         assert_eq!(stages("storing"), vec![Stage::Storing]);
+    }
+
+    /// A plug-in whose 64-bit helper uses `Global\` names needs admin.
+    #[test]
+    fn global_names_need_admin() {
+        let dir = tempfile::tempdir().unwrap();
+        let dll = dir.path().join("CLS-srep.dll");
+        fs::write(&dll, b"IO_MapFile_").unwrap();
+        assert!(!needs_admin(&dll));
+        fs::write(
+            dir.path().join("cls-srep_x64.exe"),
+            b"xx Global\\ Read_MapFile_",
+        )
+        .unwrap();
+        assert!(needs_admin(&dll));
     }
 
     /// FitGirl's arc.ini entries, and the methods that pick them.

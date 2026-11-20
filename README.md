@@ -154,7 +154,10 @@ No repack using `tor` or `lzma` has been tried yet. Archives made by FreeArc 0.6
 - **Nothing is freed until the whole repack decodes.** Before `--free-as-read` or `--delete-each` changes anything, a verify pass decodes every data file and checks every file's CRC. That pass also measures the decoders' temp files and how far the output runs ahead of the input, and checks the free space again with those numbers. `--no-verify` skips it.
 - **A full disk pauses the run instead of ending it.**
 - **A half-freed data file is never used again.** A marker file, `<data file>.unrepack-consumed`, makes any later run refuse it.
-- **The decoders can't hang the run.** A decoder's error dialog is written to the log instead of waiting for a click. Every decoder process goes into one job object: if one stage fails, the whole chain stops.
+- **Damaged downloads are caught first.** When the repack has an MD5 list (FitGirl's `MD5\*.md5`), every data file is checked against it before anything runs. A damaged language or extra is left out, and a damaged game file stops the run. Some decoders loop forever on damaged data instead of failing: FitGirl's `rzw` did on CONTROL's Spanish voices.
+- **A failing decoder stops the whole chain.** A decoder's error dialog is written to the log instead of waiting for a click. Every decoder process goes into one job object, so if one stage fails, every stage stops.
+- **Decoders that need admin are named up front.** FitGirl's `srep` and `magic2` share memory under `Global\` names, which only an elevated process may create. unrepack says to run as administrator before it starts, instead of failing partway.
+- **A failure after memory ran low says so.** Decoders that can't get memory often quit with no message. If Windows got close to its memory limit during the run, the error says so and suggests closing programs or making the pagefile larger.
 - **Built-in decoders don't trust the stream.** Where FreeArc's C code trusts sizes read from the data, the ports refuse bad ones.
 - **Decoders stay in their folder.** An `arc.ini` entry that names a program outside the decoders folder is refused.
 

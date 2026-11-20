@@ -782,12 +782,74 @@ fn confirm(question: &str) -> Result<bool> {
     Ok(line.trim().eq_ignore_ascii_case("yes"))
 }
 
+/// `<hash> *..\fg-01.bin` lines of FitGirl's MD5 lists: (lowercase file
+/// name, lowercase hash).
+fn md5_list(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|l| {
+            let (h, f) = l.trim().split_once(' ')?;
+            let f = f.trim_start_matches('*').rsplit(['\\', '/']).next()?;
+            (h.len() == 32 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+                .then(|| (f.to_lowercase(), h.to_lowercase()))
+        })
+        .collect()
+}
+
+/// Checks the data files against the repack's `MD5\*.md5`, when it has one. A
+/// torrent can leave a file damaged in the middle, where nothing else looks,
+/// and some decoders then hang instead of failing (CONTROL's rzw did). A
+/// damaged language or extra is left out, as an incomplete one is; a damaged
+/// game file stops the run.
+fn md5_check(files: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
+    let dir = files[0].parent().unwrap_or(Path::new(".")).join("MD5");
+    let want: std::collections::HashMap<String, String> = fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("md5")))
+        .flat_map(|p| md5_list(&fs::read_to_string(p).unwrap_or_default()))
+        .collect();
+    if want.is_empty() {
+        return Ok(files);
+    }
+    note!("checking the data files against the repack's MD5 list");
+    let mut kept = Vec::new();
+    for f in files {
+        let n = f
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_lowercase();
+        if let Some(h) = want.get(&n) {
+            let got: String = win::md5(&f)
+                .with_context(|| format!("reading {}", f.display()))?
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            if &got != h {
+                ensure!(
+                    kind(&n) != Kind::Required,
+                    "{n} doesn't match the repack's MD5 list, so the download is damaged; \
+                     recheck it in your torrent client. Nothing was changed"
+                );
+                note!("skipping {n}: damaged (it doesn't match the repack's MD5 list)");
+                continue;
+            }
+        }
+        kept.push(f);
+    }
+    ensure!(!kept.is_empty(), "every data file is damaged");
+    Ok(kept)
+}
+
 fn extract_cmd(a: Args) -> Result<()> {
     let out = a
         .out
         .clone()
         .context("say where to extract with -o <folder>")?;
+    win::watch_memory();
     let files = data_files(&a.inputs)?;
+    let files = md5_check(files)?;
     let src_dir = files[0].parent().map(Path::to_path_buf).unwrap_or_default();
     let lname = |p: &Path| {
         p.file_name()
@@ -1215,6 +1277,9 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             note!("error: {e:#}");
+            if let Some(m) = win::low_memory_note() {
+                note!("{m}");
+            }
             ExitCode::FAILURE
         }
     }
@@ -1223,6 +1288,37 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn md5_lists_and_hashes() {
+        let l = md5_list(
+            "; If you miss selective download files - that's OK\r\n\
+             C04729DB96D67BD7FFAF723CB1678A83 *..\\fg-optional-spanish-vo.bin\r\n\
+             d6d466f7db2de23339320c7fff3f3f70 *fg-01.bin\r\nnot a line\r\n",
+        );
+        assert_eq!(
+            l,
+            [
+                (
+                    "fg-optional-spanish-vo.bin".into(),
+                    "c04729db96d67bd7ffaf723cb1678a83".into()
+                ),
+                (
+                    "fg-01.bin".into(),
+                    "d6d466f7db2de23339320c7fff3f3f70".into()
+                )
+            ]
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("abc");
+        fs::write(&f, b"abc").unwrap();
+        let h: String = win::md5(&f)
+            .unwrap()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(h, "900150983cd24fb0d6963f7d28e17f72");
+    }
 
     /// Needs the Cyberpunk 2077 FitGirl repack next to this folder.
     #[test]
