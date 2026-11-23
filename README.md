@@ -131,10 +131,12 @@ Tested on real repacks. Every file's CRC-32 matched the one stored in the archiv
 | Crusader Kings III (DODI), 2 data files | `cls-lolz` + `cls-srep` | 52,644 files, 19.9 GB, about 6 min |
 | A FitGirl repack, 6 data files | `srep`, `magic2`, `mpzz`, `xt2png`, `dispack070`, `delta`, `4x4:rzw` | 14,015 files, 5.0 GB |
 | A FitGirl repack with rebuild steps, 9 data files, English voice | `magic2` and others, then Setup's xtool and builder steps | 5,113 files, 88.1 GB, about 52 min |
+| A FitGirl repack, 5 data files, two voice packs | `xt3aw2+xt3bk2+srep+magic2`, `srep+4x4:rzw`, `rzs`, then Setup's patch step | 267 files, 113.2 GB, about 13 min with `--no-verify` |
+| A FitGirl repack, 12 data files, all 7 voice packs | `xt4anvil+doodle9ma+srep+magic2` (Oodle), `srep+4x4:tor`, `srep+4x4:mpz`, `rzs` | 373 files, 75.4 GB, about 55 min |
 
-Freeing the repack while reading it gave the same files as keeping it. Against FitGirl's MD5 list, 4,210 of 14,011 files of the first FitGirl repack match byte for byte: the rest are images and audio its installer encrypts after unpacking, plus one movie inside `Setup.exe`. That run was before unrepack followed Setup's steps. The repack with rebuild steps, installed by following them, matches FitGirl's MD5 list in every one of its 5,113 files.
+Freeing the repack while reading it gave the same files as keeping it. Against FitGirl's MD5 list, 4,210 of 14,011 files of the first FitGirl repack match byte for byte: the rest are images and audio its installer encrypts after unpacking, plus one movie inside `Setup.exe`. That run was before unrepack followed Setup's steps. Every repack installed by following Setup's steps matches FitGirl's MD5 list in every file: the 5,113, the 267 and the 373. The 5-file repack needed an administrator window (`srep` and `magic2`), skipping a voice pack the download had damaged, and enough memory: Windows came within 1.1 GB of its limit.
 
-No repack using `tor` or `lzma` has been tried yet. Archives made by FreeArc 0.67's own `Arc.exe` from 137 MB of game files, programs and text extract with every CRC matching. That covers `tor:1` to `tor:11`, `lzma` fast, normal and max, and `4x4` around both, including frames 4x4 stored because they didn't compress. FreeArc's `-m1` to `-m9` presets also use `rep`, `exe`, `grzip` or `ppmd`, so archives made with them are still refused.
+`tor` inside `4x4` has decoded a real repack (the 12-file one). No repack using `lzma` has been tried yet. Archives made by FreeArc 0.67's own `Arc.exe` from 137 MB of game files, programs and text extract with every CRC matching. That covers `tor:1` to `tor:11`, `lzma` fast, normal and max, and `4x4` around both, including frames 4x4 stored because they didn't compress. FreeArc's `-m1` to `-m9` presets also use `rep`, `exe`, `grzip` or `ppmd`, so archives made with them are still refused.
 
 | Part | State |
 |---|---|
