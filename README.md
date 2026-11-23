@@ -38,7 +38,7 @@
   never have to fit on the disk <em>together</em>.
 </p>
 
-unrepack is a free, open-source app and command line tool for Windows. It extracts the data files of game repacks built on FreeArc, such as DODI and FitGirl repacks, straight into a game folder. It checks every file's CRC as it goes. It does not run the installer, so there is no installer UI, registry editing or redistributable setup. When the installer does more than unpack, such as rebuilding game files from pieces afterwards, unrepack reads those steps from the installer's script and follows them (see [Setup's install steps](#setups-install-steps)).
+unrepack is a free, open-source app and command line tool for Windows. It extracts the data files of game repacks built on FreeArc, such as DODI and FitGirl repacks, straight into a game folder. It checks every file's CRC as it goes. It does not run the installer, so there is no installer UI, registry editing or redistributable setup. When the installer does more than unpack, such as rebuilding game files from pieces afterwards, unrepack reads those steps from the installer's script and follows them (see [Setup's install steps](#setups-install-steps)). Games that come as plain ZIP files work too (see [Zipped games](#zipped-games)).
 
 A repack's installer needs room for the repack **and** the whole game at once. Crusader Kings III [DODI Repack] is 6.05 GB packed and 19.87 GB installed, so it needs about 26 GB of disk. With `--free-as-read`, unrepack needs 13.94 GB. It gives each data file's bytes back to the disk as soon as they are decoded, so the space the repack frees holds the game files that follow.
 
@@ -123,6 +123,19 @@ Measured by `--check` on Crusader Kings III [DODI Repack] (6.05 GB packed, 19.87
 
 The `--check` figures come before any decoding. They assume the freed input keeps pace with the output, and they leave out the decoders' temp files. The verify pass measures both and checks the space again before anything is freed.
 
+### Zipped games
+
+Some games come as plain ZIP files instead of a repack. unrepack extracts those the same way, `--free-as-read`, `--delete-each`, `--check` and the CRC checks included:
+
+```bash
+unrepack extract "Game.zip" -o "D:\Games\Game" --free-as-read
+unrepack extract "D:\Downloads\Game" -o "D:\Games\Game"     # every .zip in the folder
+```
+
+A folder counts as zipped only when it holds no repack data files, so a crack's ZIP inside a repack folder is left alone. A `Setup.exe` next to a ZIP is ignored. Stored and deflate entries work, which is what 7-Zip, WinRAR and Windows write by default, including ZIP64 archives over 4 GB. Password-protected ZIPs, other ZIP methods (`bzip2`, `lzma`, `zstd`, Deflate64), ZIPs split into parts, self-extracting `.exe` files, 7z and RAR are refused before anything changes; [HatchZip](https://github.com/xevrion/hatchzip), which this part's ZIP index reading follows, extracts all of those while freeing the archive too.
+
+Tested on a 5.84 GiB ZIP64 that 7-Zip made of a game's audio folder (5,827 files, most under 1 MB, deflate): with `--free-as-read` the plan needed 53 MB instead of 6.32 GB, and the run, check pass included, took 66 s. Every file matched the original by SHA-256, and the ZIP was gone at the end.
+
 ## Status
 
 Tested on real repacks. Every file's CRC-32 matched the one stored in the archive.
@@ -145,6 +158,8 @@ Freeing the repack while reading it gave the same files as keeping it. Against F
 | FreeArc archives and CRCs, CLS plug-ins (`cls-*.dll`), `arc.ini` decoders | Works |
 | Built-ins `lzma`, `tor`, `delta`, `dispack070`, and `4x4` around them or an `arc.ini` decoder | Works |
 | Choosing languages and extras | Works, by data file name |
+| ZIP archives, stored and deflate, ZIP64 | Works |
+| Encrypted or split ZIPs, other ZIP methods, 7z, RAR | Refused before anything changes |
 | Other built-ins (`ppmd`, `rep`, `exe`, `lzma2`, …), `4x4` around a CLS plug-in | Refused before anything changes |
 | Resume after a crash | Not yet |
 | Setup's install steps: tool archives, data file order, rebuild commands, `.ini` edits, deletes | Works, for Inno Setup 5.5 installers |

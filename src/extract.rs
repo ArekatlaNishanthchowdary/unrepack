@@ -62,6 +62,8 @@ enum Decode {
     Lzma(Lzma),
     /// `tor` (Tornado), ported in `tornado.rs`; the stream has its own header.
     Tornado,
+    /// Raw DEFLATE, for ZIP entries (`zip.rs`).
+    Deflate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -401,6 +403,7 @@ impl Decode {
             Decode::Dispack(block) => crate::builtin::dispack(input, out, *block),
             Decode::Lzma(m) => lzma(input, out, *m),
             Decode::Tornado => crate::tornado::decode(input, out),
+            Decode::Deflate => io::copy(&mut flate2::read::DeflateDecoder::new(input), out),
             Decode::Cls(_) => unreachable!("resolve keeps CLS out of 4x4"),
         }
     }
@@ -558,6 +561,7 @@ impl Decoders {
         match name {
             "lzma" => return Ok(Decode::Lzma(lzma_params(params)?)),
             "tor" => return Ok(Decode::Tornado),
+            "deflate" => return Ok(Decode::Deflate),
             // Its block size and `x` only matter when compressing.
             "delta" => return Ok(Decode::Delta),
             "dispack" | "dispack070" => {
@@ -723,6 +727,11 @@ impl Chain {
                     let mut c = Command::new(&e.exe);
                     c.args(&e.args);
                     c
+                }
+                // One per ZIP entry: inline, no thread, pipe or folder.
+                Decode::Deflate => {
+                    out = Box::new(flate2::read::DeflateDecoder::new(out));
+                    continue;
                 }
                 // Tools that work on files, and 4x4, run on a thread that
                 // feeds a pipe; each gets its own folder for its fixed names.
@@ -939,14 +948,17 @@ fn write_patiently(f: &mut File, mut buf: &[u8], path: &Path) -> io::Result<()> 
 }
 
 /// Decodes one block. With `out` set, writes its entries there; without,
-/// only checks every CRC. `punch` frees the packed bytes as they are read.
+/// only checks every CRC. `punch` frees the packed bytes as they are read,
+/// from its value on: blocks go front to back and nothing before the current
+/// one is read again, so the gap before a block and the end of the last one
+/// go too (else a ZIP of files under 1 MiB, one block each, frees nothing).
 pub fn block(
     data: &Path,
     file: &File,
     block: &Block,
     dec: &Decoders,
     out: Option<&Path>,
-    punch: bool,
+    punch: Option<&mut u64>,
     progress: &mut Progress,
 ) -> Result<()> {
     if let Some(out) = out {
@@ -966,18 +978,28 @@ pub fn block(
     let mut f = file.try_clone()?;
     use std::io::Seek;
     f.seek(io::SeekFrom::Start(block.start))?;
+    let end = block.start + block.packed;
     let reader = BlockReader {
         file: f,
         pos: block.start,
-        end: block.start + block.packed,
-        punch,
-        punched: block.start,
+        end,
+        punch: punch.is_some(),
+        punched: punch
+            .as_deref()
+            .map_or(block.start, |&w| w.min(block.start)),
         consumed: progress.consumed.clone(),
     };
     let mut chain = Chain::start(reader, &block.method, dec)?;
     let result = entries(&mut chain.out, block, out, progress, data);
     match result {
-        Ok(()) => chain.finish(),
+        Ok(()) => {
+            chain.finish()?;
+            // The reader freed up to here, rounded down, on its last read.
+            if let Some(w) = punch {
+                *w = (*w).max(end / win::UNIT * win::UNIT);
+            }
+            Ok(())
+        }
         Err(e) => {
             chain.kill();
             Err(e)
@@ -1092,9 +1114,19 @@ pub fn run(
         .with_context(|| format!("writing {}", m.display()))?;
         win::set_sparse(&file).with_context(|| format!("making {} sparse", job.data.display()))?;
     }
+    // Blocks are sorted and don't overlap (freearc::open, zip::open).
+    let mut freed = job.archive.blocks.first().map_or(0, |b| b.start);
     for b in &job.archive.blocks {
-        block(job.data, &file, b, dec, Some(out), consume, progress)
-            .with_context(|| format!("block '{}' of {}", b.method, job.data.display()))?;
+        block(
+            job.data,
+            &file,
+            b,
+            dec,
+            Some(out),
+            consume.then_some(&mut freed),
+            progress,
+        )
+        .with_context(|| format!("block '{}' of {}", b.method, job.data.display()))?;
     }
     if consume {
         drop(file);
@@ -1108,7 +1140,7 @@ pub fn run(
 pub fn verify(job: &Job, dec: &Decoders, progress: &mut Progress) -> Result<()> {
     let file = File::open(job.data).with_context(|| format!("opening {}", job.data.display()))?;
     for b in &job.archive.blocks {
-        block(job.data, &file, b, dec, None, false, progress)
+        block(job.data, &file, b, dec, None, None, progress)
             .with_context(|| format!("verifying block '{}' of {}", b.method, job.data.display()))?;
     }
     Ok(())
@@ -1307,7 +1339,7 @@ mod tests {
         let file = File::open(&data).unwrap();
         let mut p = Progress::new(3 * want.len() as u64);
         for b in &blocks {
-            block(&data, &file, b, &dec, Some(&out), false, &mut p).unwrap();
+            block(&data, &file, b, &dec, Some(&out), None, &mut p).unwrap();
         }
         assert!(fs::read(out.join("a")).unwrap() == want[..50000]);
         assert!(fs::read(out.join("b")).unwrap() == want[50000..]);

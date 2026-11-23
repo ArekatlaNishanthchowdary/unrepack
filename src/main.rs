@@ -12,6 +12,7 @@ mod inno;
 mod recipe;
 mod tornado;
 mod win;
+mod zip;
 
 use std::fs;
 use std::io::{BufRead, Write};
@@ -25,16 +26,18 @@ use extract::{Decoders, Job, Progress, human};
 const USAGE: &str = concat!(
     "unrepack ",
     env!("CARGO_PKG_VERSION"),
-    ": extract FreeArc repack data files without running the installer
+    ": extract FreeArc repack data files without running the installer,
+and plain ZIP archives the same way
 
 Usage:
-  unrepack list <data file>
-  unrepack extract <repack folder | data files...> -o <output folder> [options]
+  unrepack list <data file | zip>
+  unrepack extract <repack folder | data files... | zip files...> -o <output folder> [options]
   unrepack parts <repack folder>              which data files always install, and which
                                               are languages or extras to choose from
   unrepack decoders <Setup.exe> -o <folder>   copy the decoders out of the installer
 
-A folder extracts every data file in it. To choose languages and extras as the
+A folder extracts every data file in it, or every ZIP if it has no data files
+(stored and deflate entries; no passwords). To choose languages and extras as the
 installer would, name the data files you want. When two of them hold the same
 file, the one named later wins, as with the installer.
 
@@ -474,6 +477,19 @@ fn data_files(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
                 .filter_map(|e| e.ok().map(|e| e.path()))
                 .filter(|p| p.is_file())
                 .collect();
+            // A folder of ZIPs (a game shipped zipped). A ZIP next to FreeArc
+            // data files is something else, such as a crack, and stays put.
+            if !found.iter().any(|f| freearc::sniff(f)) {
+                let mut zips: Vec<PathBuf> = found.into_iter().filter(|f| zip::sniff(f)).collect();
+                ensure!(
+                    !zips.is_empty(),
+                    "no FreeArc data files or ZIP archives in {}",
+                    p.display()
+                );
+                zips.sort();
+                out.extend(zips);
+                continue;
+            }
             let name = |p: &Path| {
                 p.file_name()
                     .unwrap_or_default()
@@ -560,8 +576,8 @@ fn data_files(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
             out.extend(found);
         } else {
             ensure!(
-                freearc::sniff(p),
-                "{} is not a FreeArc archive",
+                freearc::sniff(p) || zip::sniff(p),
+                "{} is not a FreeArc or ZIP archive",
                 p.display()
             );
             out.push(p.clone());
@@ -571,10 +587,23 @@ fn data_files(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
         !out.is_empty(),
         "name a repack folder or its data files\n\n{USAGE}"
     );
+    ensure!(
+        out.iter().all(|f| zip::sniff(f)) || !out.iter().any(|f| zip::sniff(f)),
+        "extract ZIPs and repack data files in separate runs"
+    );
     Ok(out
         .into_iter()
         .map(|p| std::path::absolute(&p).unwrap_or(p))
         .collect())
+}
+
+/// A data file's index: FreeArc's, or a ZIP's read into the same shape.
+fn open_data(p: &Path) -> Result<freearc::Archive> {
+    if zip::sniff(p) {
+        zip::open(p)
+    } else {
+        freearc::open(p)
+    }
 }
 
 /// What a data file is to the installer, judged by its name.
@@ -705,8 +734,7 @@ fn parts(dir: &Path) -> Result<Vec<(PathBuf, Kind, bool)>> {
 /// bytes, name; tab-separated.
 fn parts_cmd(dir: &Path) -> Result<()> {
     for (f, k, on) in parts(dir)? {
-        let a =
-            freearc::open(&f).with_context(|| format!("reading the index of {}", f.display()))?;
+        let a = open_data(&f).with_context(|| format!("reading the index of {}", f.display()))?;
         println!(
             "{}\t{}\t{}\t{}\t{}",
             format!("{k:?}").to_lowercase(),
@@ -720,7 +748,7 @@ fn parts_cmd(dir: &Path) -> Result<()> {
 }
 
 fn list(path: &Path) -> Result<()> {
-    let a = freearc::open(path)?;
+    let a = open_data(path)?;
     say!(
         "{}: {} entries, {} packed, {} unpacked",
         path.display(),
@@ -865,7 +893,10 @@ fn extract_cmd(a: Args) -> Result<()> {
             .to_string_lossy()
             .to_lowercase()
     };
-    let steps = recipe_for(&src_dir)?;
+    // A Setup.exe next to a ZIP is some other download's: neither its steps
+    // nor its decoders apply.
+    let zips = zip::sniff(&files[0]);
+    let steps = if zips { None } else { recipe_for(&src_dir)? };
     // Archives Setup unpacks into its temp folder for later steps: (file,
     // the folder in it that's wanted, index).
     let mut tools = Vec::new();
@@ -932,8 +963,7 @@ fn extract_cmd(a: Args) -> Result<()> {
              the repack has to be downloaded again.",
             f.display()
         );
-        let arc =
-            freearc::open(f).with_context(|| format!("reading the index of {}", f.display()))?;
+        let arc = open_data(f).with_context(|| format!("reading the index of {}", f.display()))?;
         jobs.push((f.clone(), arc));
     }
 
@@ -944,7 +974,11 @@ fn extract_cmd(a: Args) -> Result<()> {
         None => std::env::current_exe()?.with_file_name("unrepack-clshost.exe"),
     };
     let work = a.work.clone().unwrap_or_else(|| out.join(".unrepack-work"));
-    let (dir, carved) = find_decoders(a.decoders.as_deref(), &files[0])?;
+    let (dir, carved) = if zips {
+        (Err("ZIPs need no decoders".into()), None)
+    } else {
+        find_decoders(a.decoders.as_deref(), &files[0])?
+    };
     let mut dec = Decoders {
         dir,
         host,

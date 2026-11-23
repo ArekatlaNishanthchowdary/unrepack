@@ -3368,6 +3368,7 @@ dependencies = [
  "anyhow",
  "crc32fast",
  "eframe",
+ "flate2",
  "lzma-rust2",
  "rfd",
  "tempfile",
