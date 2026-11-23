@@ -48,8 +48,10 @@ Options:
   --delete-each     delete each data file once all of it is extracted (crash safe)
   --free-as-read    free each data file's bytes as they are decoded. NOT crash safe in
                     this version: if the run stops after the first freed byte, the repack is lost
-  --no-verify       skip the decode-only pass that checks every CRC before anything is
-                    freed or deleted (halves the time, removes the safety net)
+  --verify          decode everything once, checking every CRC, before writing anything.
+                    On by default with --free-as-read and --delete-each, where it stops a
+                    bad repack before any of it is gone; it doubles the time
+  --no-verify       skip that pass even when freeing or deleting (removes the safety net)
   --yes             don't ask before freeing or deleting
 
 The repack's decoders are programs that came with the download; unrepack runs them.
@@ -88,9 +90,10 @@ fn parse() -> Result<Args> {
         check: false,
         delete_each: false,
         free_as_read: false,
-        verify: true,
+        verify: false,
         yes: false,
     };
+    let mut verify = None;
     while let Some(arg) = it.next() {
         let mut value = |name: &str| {
             it.next()
@@ -106,12 +109,17 @@ fn parse() -> Result<Args> {
             "--check" => a.check = true,
             "--delete-each" => a.delete_each = true,
             "--free-as-read" => a.free_as_read = true,
-            "--no-verify" => a.verify = false,
+            "--verify" => verify = Some(true),
+            "--no-verify" => verify = Some(false),
             "--yes" | "-y" => a.yes = true,
             s if s.starts_with('-') => bail!("unknown option {s}\n\n{USAGE}"),
             _ => a.inputs.push(PathBuf::from(arg)),
         }
     }
+    // Keeping the repack, a bad block only means rerunning into an empty
+    // folder, and the MD5 check already caught damaged downloads; decoding
+    // everything twice isn't worth it there.
+    a.verify = verify.unwrap_or(a.delete_each || a.free_as_read);
     Ok(a)
 }
 
