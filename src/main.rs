@@ -1252,6 +1252,8 @@ fn extract_cmd(a: Args) -> Result<()> {
 }
 
 fn main() -> ExitCode {
+    // ponytail: Ctrl+C skips the restore; that window keeps QuickEdit off.
+    let _quick_edit = win::quick_edit_off();
     let result = parse()
         .and_then(|a| {
             if let Some(l) = &a.log {

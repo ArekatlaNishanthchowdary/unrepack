@@ -70,6 +70,30 @@ fn text(c: &Call, i: usize) -> Result<&str> {
     }
 }
 
+/// Calls that leave the game files alone, so a recipe can skip them (DODI):
+/// copying the uninstaller's skin into `{app}\Uninstall`, running an
+/// installer under `{src}\Redist`, and the "shut down when done" box.
+fn cosmetic(c: &Call) -> bool {
+    let arg = |i| match c.args.get(i) {
+        Some(Val::Str(s)) => s.to_ascii_lowercase(),
+        _ => String::new(),
+    };
+    match c.name.to_ascii_uppercase().as_str() {
+        "FILECOPY" => {
+            let to = arg(1);
+            to.strip_prefix(r"{app}\uninstall\")
+                .is_some_and(|n| !n.is_empty() && !n.contains(['\\', '/', ':']))
+        }
+        "EXEC" => {
+            let exe = arg(0);
+            exe.strip_prefix(r"{src}\redist\")
+                .is_some_and(|n| !n.contains(['/', ':']) && !n.split('\\').any(|p| p == ".."))
+                || (exe == "{cmd}" && arg(1).starts_with("shutdown "))
+        }
+        _ => false,
+    }
+}
+
 /// A file straight inside `{src}` or `{tmp}`: its name.
 fn plain(path: &str, place: &str) -> Option<String> {
     let rest = path.strip_prefix(place)?.strip_prefix('\\')?;
@@ -93,6 +117,9 @@ pub fn steps(calls: &[Call]) -> Result<Vec<Step>> {
             && !comps.iter().any(|x| x.eq_ignore_ascii_case(s))
         {
             comps.push(s.to_string());
+        }
+        if cosmetic(c) {
+            continue;
         }
         if UNSUPPORTED.iter().any(|u| u.eq_ignore_ascii_case(name)) {
             bail!("Setup calls {name}, which unrepack can't do yet");
@@ -362,6 +389,30 @@ mod tests {
         let mut c = call("ISExec", &["", "", "", "{cmd}", "", "", "", ""]);
         c.args[4] = Val::Unknown;
         assert!(steps(&[c]).is_err());
+    }
+
+    #[test]
+    fn dodi_extras_are_skipped() {
+        let calls = [
+            call(
+                "FILECOPY",
+                &[r"{tmp}\dark.png", r"{app}\Uninstall\dark.png"],
+            ),
+            extract(r"{src}\data1.doi", r"{app}", ""),
+            call("EXEC", &[r"{src}\Redist\dxwebsetup.exe", "", ""]),
+            call("EXEC", &["{cmd}", "shutdown -s -f -t 00", ""]),
+        ];
+        let s = steps(&calls).unwrap();
+        assert_eq!(s.len(), 1);
+        assert!(!needed(&s));
+        for bad in [
+            call("FILECOPY", &[r"{tmp}\x.dll", r"{app}\x.dll"]),
+            call("FILECOPY", &[r"{tmp}\x", r"{app}\Uninstall\..\x.dll"]),
+            call("EXEC", &[r"{src}\Redist\..\..\x.exe", "", ""]),
+            call("EXEC", &["{cmd}", "/C del x", ""]),
+        ] {
+            assert!(steps(&[bad]).is_err());
+        }
     }
 
     #[test]

@@ -279,6 +279,35 @@ pub fn low_memory_note() -> Option<String> {
     })
 }
 
+/// The console mode to put back, while QuickEdit is off.
+pub struct QuickEditOff(Option<u32>);
+
+/// Turns off the console's QuickEdit mode for the run: with it on, a click in
+/// the window freezes every write to it, and the decoders (which share the
+/// console) stall until Enter or Esc. No-op without a console (the GUI).
+pub fn quick_edit_off() -> QuickEditOff {
+    use windows_sys::Win32::System::Console::{
+        ENABLE_EXTENDED_FLAGS, ENABLE_QUICK_EDIT_MODE, GetConsoleMode, GetStdHandle,
+        STD_INPUT_HANDLE, SetConsoleMode,
+    };
+    unsafe {
+        let h = GetStdHandle(STD_INPUT_HANDLE);
+        let mut m = 0;
+        let off = GetConsoleMode(h, &mut m) != 0
+            && SetConsoleMode(h, (m & !ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS) != 0;
+        QuickEditOff(off.then_some(m))
+    }
+}
+
+impl Drop for QuickEditOff {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode};
+        if let Some(m) = self.0 {
+            unsafe { SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), m) };
+        }
+    }
+}
+
 /// ERROR_DISK_FULL and ERROR_HANDLE_DISK_FULL.
 pub fn is_disk_full(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::StorageFull || matches!(e.raw_os_error(), Some(112 | 39))
