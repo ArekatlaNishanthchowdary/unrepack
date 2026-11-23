@@ -1277,6 +1277,7 @@ fn extract_cmd(a: Args) -> Result<()> {
             &mut p,
         )?;
         if delete_each && !consume {
+            extract::flush(&out, arc)?;
             fs::remove_file(f).with_context(|| format!("deleting {}", f.display()))?;
         }
     }

@@ -990,7 +990,7 @@ pub fn block(
         consumed: progress.consumed.clone(),
     };
     let mut chain = Chain::start(reader, &block.method, dec)?;
-    let result = entries(&mut chain.out, block, out, progress, data);
+    let result = entries(&mut chain.out, block, out, progress, data, punch.is_some());
     match result {
         Ok(()) => {
             chain.finish()?;
@@ -1024,6 +1024,7 @@ fn entries(
     out: Option<&Path>,
     progress: &mut Progress,
     data: &Path,
+    sync: bool,
 ) -> Result<()> {
     let mut buf = vec![0u8; 1 << 20];
     let what = if out.is_some() {
@@ -1068,14 +1069,50 @@ fn entries(
             e.path.display(),
             e.crc
         );
+        // Flushed per file only while the input is being freed: it was half
+        // the time of a ZIP of 5,827 files. `flush` covers --delete-each.
         if let (Some(f), Some(p), Some(t)) = (file, part, target) {
-            f.sync_all()
-                .with_context(|| format!("flushing {}", p.display()))?;
+            if sync {
+                f.sync_all()
+                    .with_context(|| format!("flushing {}", p.display()))?;
+            }
             drop(f);
             fs::rename(&p, &t).with_context(|| format!("renaming {}", p.display()))?;
         }
     }
     Ok(())
+}
+
+/// Forces the files a data file wrote onto the disk, 16 at a time, so that
+/// deleting the data file afterwards can't lose both to a power cut.
+pub fn flush(out: &Path, archive: &Archive) -> Result<()> {
+    let files: Vec<PathBuf> = archive
+        .blocks
+        .iter()
+        .flat_map(|b| &b.entries)
+        .filter(|e| !e.is_dir)
+        .map(|e| out.join(&e.path))
+        .collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        let workers: Vec<_> = (0..16)
+            .map(|_| {
+                s.spawn(|| -> Result<()> {
+                    while let Some(p) = files.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        OpenOptions::new()
+                            .write(true)
+                            .open(p)
+                            .and_then(|f| f.sync_all())
+                            .with_context(|| format!("flushing {}", p.display()))?;
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .try_for_each(|w| w.join().expect("flush thread panicked"))
+    })
 }
 
 /// The marker that says a data file is partly consumed and can't be used
