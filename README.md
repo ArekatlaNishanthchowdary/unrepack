@@ -134,7 +134,7 @@ unrepack extract "D:\Downloads\Game" -o "D:\Games\Game"     # every .zip in the 
 
 A folder counts as zipped only when it holds no repack data files, so a crack's ZIP inside a repack folder is left alone. A `Setup.exe` next to a ZIP is ignored. Stored and deflate entries work, which is what 7-Zip, WinRAR and Windows write by default, including ZIP64 archives over 4 GB. Password-protected ZIPs, other ZIP methods (`bzip2`, `lzma`, `zstd`, Deflate64), ZIPs split into parts, self-extracting `.exe` files, 7z and RAR are refused before anything changes; [HatchZip](https://github.com/xevrion/hatchzip), which this part's ZIP index reading follows, extracts all of those while freeing the archive too.
 
-Tested on a 5.84 GiB ZIP64 that 7-Zip made of a game's audio folder (5,827 files, most under 1 MB, deflate): with `--free-as-read` the plan needed 53 MB instead of 6.32 GB, and the run, check pass included, took 66 s. Every file matched the original by SHA-256, and the ZIP was gone at the end.
+Tested on a 5.84 GiB ZIP64 that 7-Zip made of a game's audio folder (5,827 files, most under 1 MB, deflate): with `--free-as-read` the plan needed 53 MB instead of 6.32 GB, and the run, check pass included, took 66 s. Every file matched the original by SHA-256, and the ZIP was gone at the end. Keeping the ZIP, or with `--delete-each`, the same extraction takes 20 to 40 s; before 0.2.1 it took 40 to 70 s, because every file was forced to disk as it was written. Now that only happens with `--free-as-read`, where the input is already gone; `--delete-each` forces a data file's output to disk in one pass before deleting it.
 
 ## Status
 
