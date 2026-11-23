@@ -62,6 +62,8 @@ enum Decode {
     Lzma(Lzma),
     /// `tor` (Tornado), ported in `tornado.rs`; the stream has its own header.
     Tornado,
+    /// Raw DEFLATE, for ZIP entries (`zip.rs`).
+    Deflate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -401,6 +403,7 @@ impl Decode {
             Decode::Dispack(block) => crate::builtin::dispack(input, out, *block),
             Decode::Lzma(m) => lzma(input, out, *m),
             Decode::Tornado => crate::tornado::decode(input, out),
+            Decode::Deflate => io::copy(&mut flate2::read::DeflateDecoder::new(input), out),
             Decode::Cls(_) => unreachable!("resolve keeps CLS out of 4x4"),
         }
     }
@@ -558,6 +561,7 @@ impl Decoders {
         match name {
             "lzma" => return Ok(Decode::Lzma(lzma_params(params)?)),
             "tor" => return Ok(Decode::Tornado),
+            "deflate" => return Ok(Decode::Deflate),
             // Its block size and `x` only matter when compressing.
             "delta" => return Ok(Decode::Delta),
             "dispack" | "dispack070" => {
@@ -602,6 +606,11 @@ impl Decoders {
                 "the CLS host {} is missing",
                 self.host.display()
             );
+            ensure!(
+                unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() } != 0 || !needs_admin(&p),
+                "the '{name}' decoder needs administrator rights (Windows lets only those create its \
+                 shared memory); run unrepack from a window opened with Run as administrator"
+            );
             return Ok(Some(Decode::Cls(p)));
         }
         Ok(External::from_ini(&ini, dir, name, params, &self.pending)?.map(Decode::Ext))
@@ -616,6 +625,17 @@ impl Decoders {
         }
         Ok(())
     }
+}
+
+/// Whether a CLS plug-in or its 64-bit helper names shared memory under
+/// `Global\`, which only an elevated process may create (FitGirl's srep and
+/// magic2 do; the installer always runs elevated).
+fn needs_admin(dll: &Path) -> bool {
+    let stem = dll.file_stem().unwrap_or_default().to_string_lossy();
+    let x64 = dll.with_file_name(format!("{stem}_x64.exe"));
+    [dll, &x64]
+        .iter()
+        .any(|p| fs::read(p).is_ok_and(|b| b.windows(7).any(|w| w == b"Global\\")))
 }
 
 /// Reads one block's packed bytes in order, freeing them behind itself when
@@ -707,6 +727,11 @@ impl Chain {
                     let mut c = Command::new(&e.exe);
                     c.args(&e.args);
                     c
+                }
+                // One per ZIP entry: inline, no thread, pipe or folder.
+                Decode::Deflate => {
+                    out = Box::new(flate2::read::DeflateDecoder::new(out));
+                    continue;
                 }
                 // Tools that work on files, and 4x4, run on a thread that
                 // feeds a pipe; each gets its own folder for its fixed names.
@@ -923,14 +948,17 @@ fn write_patiently(f: &mut File, mut buf: &[u8], path: &Path) -> io::Result<()> 
 }
 
 /// Decodes one block. With `out` set, writes its entries there; without,
-/// only checks every CRC. `punch` frees the packed bytes as they are read.
+/// only checks every CRC. `punch` frees the packed bytes as they are read,
+/// from its value on: blocks go front to back and nothing before the current
+/// one is read again, so the gap before a block and the end of the last one
+/// go too (else a ZIP of files under 1 MiB, one block each, frees nothing).
 pub fn block(
     data: &Path,
     file: &File,
     block: &Block,
     dec: &Decoders,
     out: Option<&Path>,
-    punch: bool,
+    punch: Option<&mut u64>,
     progress: &mut Progress,
 ) -> Result<()> {
     if let Some(out) = out {
@@ -950,18 +978,28 @@ pub fn block(
     let mut f = file.try_clone()?;
     use std::io::Seek;
     f.seek(io::SeekFrom::Start(block.start))?;
+    let end = block.start + block.packed;
     let reader = BlockReader {
         file: f,
         pos: block.start,
-        end: block.start + block.packed,
-        punch,
-        punched: block.start,
+        end,
+        punch: punch.is_some(),
+        punched: punch
+            .as_deref()
+            .map_or(block.start, |&w| w.min(block.start)),
         consumed: progress.consumed.clone(),
     };
     let mut chain = Chain::start(reader, &block.method, dec)?;
-    let result = entries(&mut chain.out, block, out, progress, data);
+    let result = entries(&mut chain.out, block, out, progress, data, punch.is_some());
     match result {
-        Ok(()) => chain.finish(),
+        Ok(()) => {
+            chain.finish()?;
+            // The reader freed up to here, rounded down, on its last read.
+            if let Some(w) = punch {
+                *w = (*w).max(end / win::UNIT * win::UNIT);
+            }
+            Ok(())
+        }
         Err(e) => {
             chain.kill();
             Err(e)
@@ -986,6 +1024,7 @@ fn entries(
     out: Option<&Path>,
     progress: &mut Progress,
     data: &Path,
+    sync: bool,
 ) -> Result<()> {
     let mut buf = vec![0u8; 1 << 20];
     let what = if out.is_some() {
@@ -1030,14 +1069,50 @@ fn entries(
             e.path.display(),
             e.crc
         );
+        // Flushed per file only while the input is being freed: it was half
+        // the time of a ZIP of 5,827 files. `flush` covers --delete-each.
         if let (Some(f), Some(p), Some(t)) = (file, part, target) {
-            f.sync_all()
-                .with_context(|| format!("flushing {}", p.display()))?;
+            if sync {
+                f.sync_all()
+                    .with_context(|| format!("flushing {}", p.display()))?;
+            }
             drop(f);
             fs::rename(&p, &t).with_context(|| format!("renaming {}", p.display()))?;
         }
     }
     Ok(())
+}
+
+/// Forces the files a data file wrote onto the disk, 16 at a time, so that
+/// deleting the data file afterwards can't lose both to a power cut.
+pub fn flush(out: &Path, archive: &Archive) -> Result<()> {
+    let files: Vec<PathBuf> = archive
+        .blocks
+        .iter()
+        .flat_map(|b| &b.entries)
+        .filter(|e| !e.is_dir)
+        .map(|e| out.join(&e.path))
+        .collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        let workers: Vec<_> = (0..16)
+            .map(|_| {
+                s.spawn(|| -> Result<()> {
+                    while let Some(p) = files.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        OpenOptions::new()
+                            .write(true)
+                            .open(p)
+                            .and_then(|f| f.sync_all())
+                            .with_context(|| format!("flushing {}", p.display()))?;
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .try_for_each(|w| w.join().expect("flush thread panicked"))
+    })
 }
 
 /// The marker that says a data file is partly consumed and can't be used
@@ -1076,9 +1151,19 @@ pub fn run(
         .with_context(|| format!("writing {}", m.display()))?;
         win::set_sparse(&file).with_context(|| format!("making {} sparse", job.data.display()))?;
     }
+    // Blocks are sorted and don't overlap (freearc::open, zip::open).
+    let mut freed = job.archive.blocks.first().map_or(0, |b| b.start);
     for b in &job.archive.blocks {
-        block(job.data, &file, b, dec, Some(out), consume, progress)
-            .with_context(|| format!("block '{}' of {}", b.method, job.data.display()))?;
+        block(
+            job.data,
+            &file,
+            b,
+            dec,
+            Some(out),
+            consume.then_some(&mut freed),
+            progress,
+        )
+        .with_context(|| format!("block '{}' of {}", b.method, job.data.display()))?;
     }
     if consume {
         drop(file);
@@ -1092,7 +1177,7 @@ pub fn run(
 pub fn verify(job: &Job, dec: &Decoders, progress: &mut Progress) -> Result<()> {
     let file = File::open(job.data).with_context(|| format!("opening {}", job.data.display()))?;
     for b in &job.archive.blocks {
-        block(job.data, &file, b, dec, None, false, progress)
+        block(job.data, &file, b, dec, None, None, progress)
             .with_context(|| format!("verifying block '{}' of {}", b.method, job.data.display()))?;
     }
     Ok(())
@@ -1291,7 +1376,7 @@ mod tests {
         let file = File::open(&data).unwrap();
         let mut p = Progress::new(3 * want.len() as u64);
         for b in &blocks {
-            block(&data, &file, b, &dec, Some(&out), false, &mut p).unwrap();
+            block(&data, &file, b, &dec, Some(&out), None, &mut p).unwrap();
         }
         assert!(fs::read(out.join("a")).unwrap() == want[..50000]);
         assert!(fs::read(out.join("b")).unwrap() == want[50000..]);
@@ -1385,6 +1470,21 @@ mod tests {
             ]
         );
         assert_eq!(stages("storing"), vec![Stage::Storing]);
+    }
+
+    /// A plug-in whose 64-bit helper uses `Global\` names needs admin.
+    #[test]
+    fn global_names_need_admin() {
+        let dir = tempfile::tempdir().unwrap();
+        let dll = dir.path().join("CLS-srep.dll");
+        fs::write(&dll, b"IO_MapFile_").unwrap();
+        assert!(!needs_admin(&dll));
+        fs::write(
+            dir.path().join("cls-srep_x64.exe"),
+            b"xx Global\\ Read_MapFile_",
+        )
+        .unwrap();
+        assert!(needs_admin(&dll));
     }
 
     /// FitGirl's arc.ini entries, and the methods that pick them.

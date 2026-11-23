@@ -12,6 +12,7 @@ mod inno;
 mod recipe;
 mod tornado;
 mod win;
+mod zip;
 
 use std::fs;
 use std::io::{BufRead, Write};
@@ -25,16 +26,18 @@ use extract::{Decoders, Job, Progress, human};
 const USAGE: &str = concat!(
     "unrepack ",
     env!("CARGO_PKG_VERSION"),
-    ": extract FreeArc repack data files without running the installer
+    ": extract FreeArc repack data files without running the installer,
+and plain ZIP archives the same way
 
 Usage:
-  unrepack list <data file>
-  unrepack extract <repack folder | data files...> -o <output folder> [options]
+  unrepack list <data file | zip>
+  unrepack extract <repack folder | data files... | zip files...> -o <output folder> [options]
   unrepack parts <repack folder>              which data files always install, and which
                                               are languages or extras to choose from
   unrepack decoders <Setup.exe> -o <folder>   copy the decoders out of the installer
 
-A folder extracts every data file in it. To choose languages and extras as the
+A folder extracts every data file in it, or every ZIP if it has no data files
+(stored and deflate entries; no passwords). To choose languages and extras as the
 installer would, name the data files you want. When two of them hold the same
 file, the one named later wins, as with the installer.
 
@@ -48,8 +51,10 @@ Options:
   --delete-each     delete each data file once all of it is extracted (crash safe)
   --free-as-read    free each data file's bytes as they are decoded. NOT crash safe in
                     this version: if the run stops after the first freed byte, the repack is lost
-  --no-verify       skip the decode-only pass that checks every CRC before anything is
-                    freed or deleted (halves the time, removes the safety net)
+  --verify          decode everything once, checking every CRC, before writing anything.
+                    On by default with --free-as-read and --delete-each, where it stops a
+                    bad repack before any of it is gone; it doubles the time
+  --no-verify       skip that pass even when freeing or deleting (removes the safety net)
   --yes             don't ask before freeing or deleting
 
 The repack's decoders are programs that came with the download; unrepack runs them.
@@ -88,9 +93,10 @@ fn parse() -> Result<Args> {
         check: false,
         delete_each: false,
         free_as_read: false,
-        verify: true,
+        verify: false,
         yes: false,
     };
+    let mut verify = None;
     while let Some(arg) = it.next() {
         let mut value = |name: &str| {
             it.next()
@@ -106,12 +112,17 @@ fn parse() -> Result<Args> {
             "--check" => a.check = true,
             "--delete-each" => a.delete_each = true,
             "--free-as-read" => a.free_as_read = true,
-            "--no-verify" => a.verify = false,
+            "--verify" => verify = Some(true),
+            "--no-verify" => verify = Some(false),
             "--yes" | "-y" => a.yes = true,
             s if s.starts_with('-') => bail!("unknown option {s}\n\n{USAGE}"),
             _ => a.inputs.push(PathBuf::from(arg)),
         }
     }
+    // Keeping the repack, a bad block only means rerunning into an empty
+    // folder, and the MD5 check already caught damaged downloads; decoding
+    // everything twice isn't worth it there.
+    a.verify = verify.unwrap_or(a.delete_each || a.free_as_read);
     Ok(a)
 }
 
@@ -466,6 +477,19 @@ fn data_files(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
                 .filter_map(|e| e.ok().map(|e| e.path()))
                 .filter(|p| p.is_file())
                 .collect();
+            // A folder of ZIPs (a game shipped zipped). A ZIP next to FreeArc
+            // data files is something else, such as a crack, and stays put.
+            if !found.iter().any(|f| freearc::sniff(f)) {
+                let mut zips: Vec<PathBuf> = found.into_iter().filter(|f| zip::sniff(f)).collect();
+                ensure!(
+                    !zips.is_empty(),
+                    "no FreeArc data files or ZIP archives in {}",
+                    p.display()
+                );
+                zips.sort();
+                out.extend(zips);
+                continue;
+            }
             let name = |p: &Path| {
                 p.file_name()
                     .unwrap_or_default()
@@ -552,8 +576,8 @@ fn data_files(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
             out.extend(found);
         } else {
             ensure!(
-                freearc::sniff(p),
-                "{} is not a FreeArc archive",
+                freearc::sniff(p) || zip::sniff(p),
+                "{} is not a FreeArc or ZIP archive",
                 p.display()
             );
             out.push(p.clone());
@@ -563,10 +587,23 @@ fn data_files(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
         !out.is_empty(),
         "name a repack folder or its data files\n\n{USAGE}"
     );
+    ensure!(
+        out.iter().all(|f| zip::sniff(f)) || !out.iter().any(|f| zip::sniff(f)),
+        "extract ZIPs and repack data files in separate runs"
+    );
     Ok(out
         .into_iter()
         .map(|p| std::path::absolute(&p).unwrap_or(p))
         .collect())
+}
+
+/// A data file's index: FreeArc's, or a ZIP's read into the same shape.
+fn open_data(p: &Path) -> Result<freearc::Archive> {
+    if zip::sniff(p) {
+        zip::open(p)
+    } else {
+        freearc::open(p)
+    }
 }
 
 /// What a data file is to the installer, judged by its name.
@@ -697,8 +734,7 @@ fn parts(dir: &Path) -> Result<Vec<(PathBuf, Kind, bool)>> {
 /// bytes, name; tab-separated.
 fn parts_cmd(dir: &Path) -> Result<()> {
     for (f, k, on) in parts(dir)? {
-        let a =
-            freearc::open(&f).with_context(|| format!("reading the index of {}", f.display()))?;
+        let a = open_data(&f).with_context(|| format!("reading the index of {}", f.display()))?;
         println!(
             "{}\t{}\t{}\t{}\t{}",
             format!("{k:?}").to_lowercase(),
@@ -712,7 +748,7 @@ fn parts_cmd(dir: &Path) -> Result<()> {
 }
 
 fn list(path: &Path) -> Result<()> {
-    let a = freearc::open(path)?;
+    let a = open_data(path)?;
     say!(
         "{}: {} entries, {} packed, {} unpacked",
         path.display(),
@@ -782,12 +818,74 @@ fn confirm(question: &str) -> Result<bool> {
     Ok(line.trim().eq_ignore_ascii_case("yes"))
 }
 
+/// `<hash> *..\fg-01.bin` lines of FitGirl's MD5 lists: (lowercase file
+/// name, lowercase hash).
+fn md5_list(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|l| {
+            let (h, f) = l.trim().split_once(' ')?;
+            let f = f.trim_start_matches('*').rsplit(['\\', '/']).next()?;
+            (h.len() == 32 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+                .then(|| (f.to_lowercase(), h.to_lowercase()))
+        })
+        .collect()
+}
+
+/// Checks the data files against the repack's `MD5\*.md5`, when it has one. A
+/// torrent can leave a file damaged in the middle, where nothing else looks,
+/// and some decoders then hang instead of failing (CONTROL's rzw did). A
+/// damaged language or extra is left out, as an incomplete one is; a damaged
+/// game file stops the run.
+fn md5_check(files: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
+    let dir = files[0].parent().unwrap_or(Path::new(".")).join("MD5");
+    let want: std::collections::HashMap<String, String> = fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("md5")))
+        .flat_map(|p| md5_list(&fs::read_to_string(p).unwrap_or_default()))
+        .collect();
+    if want.is_empty() {
+        return Ok(files);
+    }
+    note!("checking the data files against the repack's MD5 list");
+    let mut kept = Vec::new();
+    for f in files {
+        let n = f
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_lowercase();
+        if let Some(h) = want.get(&n) {
+            let got: String = win::md5(&f)
+                .with_context(|| format!("reading {}", f.display()))?
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            if &got != h {
+                ensure!(
+                    kind(&n) != Kind::Required,
+                    "{n} doesn't match the repack's MD5 list, so the download is damaged; \
+                     recheck it in your torrent client. Nothing was changed"
+                );
+                note!("skipping {n}: damaged (it doesn't match the repack's MD5 list)");
+                continue;
+            }
+        }
+        kept.push(f);
+    }
+    ensure!(!kept.is_empty(), "every data file is damaged");
+    Ok(kept)
+}
+
 fn extract_cmd(a: Args) -> Result<()> {
     let out = a
         .out
         .clone()
         .context("say where to extract with -o <folder>")?;
+    win::watch_memory();
     let files = data_files(&a.inputs)?;
+    let files = md5_check(files)?;
     let src_dir = files[0].parent().map(Path::to_path_buf).unwrap_or_default();
     let lname = |p: &Path| {
         p.file_name()
@@ -795,7 +893,10 @@ fn extract_cmd(a: Args) -> Result<()> {
             .to_string_lossy()
             .to_lowercase()
     };
-    let steps = recipe_for(&src_dir)?;
+    // A Setup.exe next to a ZIP is some other download's: neither its steps
+    // nor its decoders apply.
+    let zips = zip::sniff(&files[0]);
+    let steps = if zips { None } else { recipe_for(&src_dir)? };
     // Archives Setup unpacks into its temp folder for later steps: (file,
     // the folder in it that's wanted, index).
     let mut tools = Vec::new();
@@ -862,8 +963,7 @@ fn extract_cmd(a: Args) -> Result<()> {
              the repack has to be downloaded again.",
             f.display()
         );
-        let arc =
-            freearc::open(f).with_context(|| format!("reading the index of {}", f.display()))?;
+        let arc = open_data(f).with_context(|| format!("reading the index of {}", f.display()))?;
         jobs.push((f.clone(), arc));
     }
 
@@ -874,7 +974,11 @@ fn extract_cmd(a: Args) -> Result<()> {
         None => std::env::current_exe()?.with_file_name("unrepack-clshost.exe"),
     };
     let work = a.work.clone().unwrap_or_else(|| out.join(".unrepack-work"));
-    let (dir, carved) = find_decoders(a.decoders.as_deref(), &files[0])?;
+    let (dir, carved) = if zips {
+        (Err("ZIPs need no decoders".into()), None)
+    } else {
+        find_decoders(a.decoders.as_deref(), &files[0])?
+    };
     let mut dec = Decoders {
         dir,
         host,
@@ -1173,6 +1277,7 @@ fn extract_cmd(a: Args) -> Result<()> {
             &mut p,
         )?;
         if delete_each && !consume {
+            extract::flush(&out, arc)?;
             fs::remove_file(f).with_context(|| format!("deleting {}", f.display()))?;
         }
     }
@@ -1182,6 +1287,8 @@ fn extract_cmd(a: Args) -> Result<()> {
 }
 
 fn main() -> ExitCode {
+    // ponytail: Ctrl+C skips the restore; that window keeps QuickEdit off.
+    let _quick_edit = win::quick_edit_off();
     let result = parse()
         .and_then(|a| {
             if let Some(l) = &a.log {
@@ -1215,6 +1322,9 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             note!("error: {e:#}");
+            if let Some(m) = win::low_memory_note() {
+                note!("{m}");
+            }
             ExitCode::FAILURE
         }
     }
@@ -1223,6 +1333,37 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn md5_lists_and_hashes() {
+        let l = md5_list(
+            "; If you miss selective download files - that's OK\r\n\
+             C04729DB96D67BD7FFAF723CB1678A83 *..\\fg-optional-spanish-vo.bin\r\n\
+             d6d466f7db2de23339320c7fff3f3f70 *fg-01.bin\r\nnot a line\r\n",
+        );
+        assert_eq!(
+            l,
+            [
+                (
+                    "fg-optional-spanish-vo.bin".into(),
+                    "c04729db96d67bd7ffaf723cb1678a83".into()
+                ),
+                (
+                    "fg-01.bin".into(),
+                    "d6d466f7db2de23339320c7fff3f3f70".into()
+                )
+            ]
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("abc");
+        fs::write(&f, b"abc").unwrap();
+        let h: String = win::md5(&f)
+            .unwrap()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(h, "900150983cd24fb0d6963f7d28e17f72");
+    }
 
     /// Needs the Cyberpunk 2077 FitGirl repack next to this folder.
     #[test]

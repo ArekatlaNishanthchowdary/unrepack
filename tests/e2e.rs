@@ -280,6 +280,49 @@ fn ok(o: &std::process::Output) {
     );
 }
 
+/// A ZIP as Windows itself writes one (.NET's ZipArchive, deflate), in a
+/// folder with an unrelated Setup.exe next to it, which must be ignored.
+#[test]
+fn a_zip_folder_extracts_and_is_freed_as_read() {
+    let t = tempfile::tempdir().unwrap();
+    let src = t.path().join("src");
+    let files = sample_files();
+    for f in &files {
+        fs::create_dir_all(src.join(f.dir)).unwrap();
+        fs::write(src.join(f.dir).join(f.name), &f.data).unwrap();
+    }
+    let dl = t.path().join("download");
+    fs::create_dir_all(&dl).unwrap();
+    fs::write(dl.join("Setup.exe"), b"MZ not a real installer").unwrap();
+    let zip = dl.join("game.zip");
+    let ps = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Compress-Archive -Path $env:SRC -DestinationPath $env:ZIP",
+        ])
+        .env("SRC", src.join("*"))
+        .env("ZIP", &zip)
+        .status()
+        .unwrap();
+    assert!(ps.success());
+    let out = t.path().join("out");
+    let o = unrepack(&[
+        "extract".as_ref(),
+        dl.as_os_str(),
+        "-o".as_ref(),
+        out.as_os_str(),
+        "--free-as-read".as_ref(),
+        "--yes".as_ref(),
+    ]);
+    ok(&o);
+    assert_extracted(&out, &files);
+    assert!(!zip.exists(), "zip deleted once extracted");
+    assert!(dl.join("Setup.exe").exists());
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    assert!(!stdout.contains("decoders: read"), "{stdout}");
+}
+
 #[test]
 fn stored_block_extracts_and_keeps_the_archive() {
     let (t, arc, o) = extract("storing", &[]);

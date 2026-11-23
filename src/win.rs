@@ -191,6 +191,123 @@ pub fn volume(path: &Path) -> io::Result<u32> {
     Ok(info.dwVolumeSerialNumber)
 }
 
+/// A file's MD5, through Windows' own BCrypt (no extra crate).
+pub fn md5(path: &Path) -> io::Result<[u8; 16]> {
+    use std::io::Read;
+    use windows_sys::Win32::Security::Cryptography::{
+        BCRYPT_MD5_ALG_HANDLE, BCryptCreateHash, BCryptDestroyHash, BCryptFinishHash,
+        BCryptHashData,
+    };
+    let fail = |s: i32| io::Error::other(format!("MD5 failed (NTSTATUS {s:#x})"));
+    let mut h = std::ptr::null_mut();
+    let s = unsafe {
+        BCryptCreateHash(
+            BCRYPT_MD5_ALG_HANDLE,
+            &mut h,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+            0,
+            0,
+        )
+    };
+    if s != 0 {
+        return Err(fail(s));
+    }
+    let res = (|| {
+        let mut f = File::open(path)?;
+        let mut buf = vec![0u8; 4 << 20];
+        loop {
+            let n = f.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            let s = unsafe { BCryptHashData(h, buf.as_ptr(), n as u32, 0) };
+            if s != 0 {
+                return Err(fail(s));
+            }
+        }
+        let mut out = [0u8; 16];
+        let s = unsafe { BCryptFinishHash(h, out.as_mut_ptr(), 16, 0) };
+        if s != 0 {
+            return Err(fail(s));
+        }
+        Ok(out)
+    })();
+    unsafe { BCryptDestroyHash(h) };
+    res
+}
+
+/// Memory Windows can still promise (commit limit minus what's committed),
+/// and the limit itself.
+fn commit_free() -> (u64, u64) {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+    if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
+        return (u64::MAX, u64::MAX);
+    }
+    (m.ullAvailPageFile, m.ullTotalPageFile)
+}
+
+static LOWEST_FREE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Notes, twice a second for the rest of the run, the least memory Windows
+/// had left to give. Decoders that can't get memory often just exit 1.
+pub fn watch_memory() {
+    std::thread::spawn(|| {
+        loop {
+            LOWEST_FREE.fetch_min(commit_free().0, std::sync::atomic::Ordering::Relaxed);
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    });
+}
+
+/// Said after a failure, if memory got nearly full during the run.
+pub fn low_memory_note() -> Option<String> {
+    let low = LOWEST_FREE.load(std::sync::atomic::Ordering::Relaxed);
+    let limit = commit_free().1;
+    // ponytail: 2 GB or 5% of the limit; the CONTROL failure had about 1 GB.
+    (low < (2u64 << 30).max(limit / 20)).then(|| {
+        format!(
+            "Windows was nearly out of memory during this run (at one point only {:.1} GB of its \
+             {:.1} GB limit was left), which can make a decoder quit without a message. Close other \
+             programs or make the pagefile larger, then run again.",
+            low as f64 / f64::from(1u32 << 30),
+            limit as f64 / f64::from(1u32 << 30)
+        )
+    })
+}
+
+/// The console mode to put back, while QuickEdit is off.
+pub struct QuickEditOff(Option<u32>);
+
+/// Turns off the console's QuickEdit mode for the run: with it on, a click in
+/// the window freezes every write to it, and the decoders (which share the
+/// console) stall until Enter or Esc. No-op without a console (the GUI).
+pub fn quick_edit_off() -> QuickEditOff {
+    use windows_sys::Win32::System::Console::{
+        ENABLE_EXTENDED_FLAGS, ENABLE_QUICK_EDIT_MODE, GetConsoleMode, GetStdHandle,
+        STD_INPUT_HANDLE, SetConsoleMode,
+    };
+    unsafe {
+        let h = GetStdHandle(STD_INPUT_HANDLE);
+        let mut m = 0;
+        let off = GetConsoleMode(h, &mut m) != 0
+            && SetConsoleMode(h, (m & !ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS) != 0;
+        QuickEditOff(off.then_some(m))
+    }
+}
+
+impl Drop for QuickEditOff {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode};
+        if let Some(m) = self.0 {
+            unsafe { SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), m) };
+        }
+    }
+}
+
 /// ERROR_DISK_FULL and ERROR_HANDLE_DISK_FULL.
 pub fn is_disk_full(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::StorageFull || matches!(e.raw_os_error(), Some(112 | 39))
