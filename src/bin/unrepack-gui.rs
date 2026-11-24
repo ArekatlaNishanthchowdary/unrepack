@@ -22,6 +22,8 @@ enum Mode {
     Keep,
     DeleteEach,
     FreeAsRead,
+    /// Full space saver with "free each block only once its files are saved".
+    FreePerBlock,
 }
 
 /// One data file, as `unrepack parts` describes it.
@@ -79,6 +81,7 @@ fn cli_args(inputs: &[String], out: &str, decoders: &str, mode: Mode, check: boo
             Mode::Keep => "--no-verify",
             Mode::DeleteEach => "--delete-each",
             Mode::FreeAsRead => "--free-as-read",
+            Mode::FreePerBlock => "--free-per-block",
         }
         .into(),
     );
@@ -532,9 +535,11 @@ impl App {
         self.outcome = Some(if run.stopped {
             let mut msg = "Stopped.".to_string();
             if !run.check_only {
-                msg += " The install folder holds part of the game; empty it before trying again.";
+                msg += " Press Unpack again, with the same repack, folder and choices, to continue \
+                         where it stopped.";
                 if run.mode == Mode::FreeAsRead && run.extracting {
-                    msg += " The repack was partly freed and can't be used again.";
+                    msg += " The data file being read was partly freed: if so, unrepack names it, \
+                             to download again.";
                 }
             }
             Outcome::Stopped(msg)
@@ -575,7 +580,7 @@ impl App {
         }
     }
 
-    /// Stopping now loses the repack.
+    /// Stopping now loses part of the data file being read.
     fn stop_destroys(&self) -> bool {
         self.run
             .as_ref()
@@ -643,6 +648,19 @@ impl App {
                 if let Some(d) = Self::folder_row(ui, "Install to", &mut self.out) {
                     self.out = d.display().to_string();
                 }
+                // The CLI's journal of a run that stopped.
+                if !self.out.trim().is_empty()
+                    && Path::new(self.out.trim()).join(".unrepack-resume").is_file()
+                {
+                    ui.label(
+                        RichText::new(
+                            "This folder holds an unpacking that stopped. Unpack continues it; use \
+                             the same repack and the same choice under \"While unpacking\".",
+                        )
+                        .small()
+                        .color(ui.visuals().warn_fg_color),
+                    );
+                }
                 if let Some(d) = Self::folder_row(ui, "Decoders (optional)", &mut self.decoders) {
                     self.decoders = d.display().to_string();
                 }
@@ -661,26 +679,54 @@ impl App {
 
             card(ui, "While unpacking", |ui| {
                 let warn = ui.visuals().warn_fg_color;
+                let per_block = self.mode == Mode::FreePerBlock;
                 for (mode, title, note, risky) in [
-                    (Mode::Keep, "Keep the repack", "Safe. Needs room for both the repack and the game.", false),
                     (
-                        Mode::DeleteEach,
-                        "Delete each data file once it is fully unpacked",
-                        "Safe. Frees space as it goes; every file is checked first.",
+                        Mode::Keep,
+                        "Keep the repack",
+                        "Safe. Needs room for both the repack and the game. A stopped run continues.",
                         false,
                     ),
                     (
-                        Mode::FreeAsRead,
-                        "Free the repack while reading it",
-                        "Least space. NOT safe: a crash or power cut loses the repack.",
-                        true,
+                        Mode::DeleteEach,
+                        "Delete each data file once it is fully unpacked",
+                        "Safe. Frees space as it goes; every file is checked first. A stopped run continues.",
+                        false,
                     ),
+                    if per_block {
+                        (
+                            Mode::FreePerBlock,
+                            "Free the repack while reading it",
+                            "Safe. A stopped run continues, but a data file that is one block (most DODI \
+                             repacks) is only freed once it is done, like the option above.",
+                            false,
+                        )
+                    } else {
+                        (
+                            Mode::FreeAsRead,
+                            "Free the repack while reading it",
+                            "Least space. A crash or power cut partway loses the data file being read: \
+                             you'd download that one again.",
+                            true,
+                        )
+                    },
                 ] {
                     ui.radio_value(&mut self.mode, mode, title);
                     ui.add_space(-6.0);
                     ui.indent(mode as u8, |ui| {
                         let note = RichText::new(note).small();
                         ui.label(if risky { note.color(warn) } else { note.weak() });
+                        if matches!(mode, Mode::FreeAsRead | Mode::FreePerBlock) {
+                            let mut safe = per_block;
+                            let label = "Free each block only once its files are saved";
+                            if ui.checkbox(&mut safe, label).changed() {
+                                self.mode = if safe {
+                                    Mode::FreePerBlock
+                                } else {
+                                    Mode::FreeAsRead
+                                };
+                            }
+                        }
                     });
                 }
             });
@@ -740,7 +786,9 @@ impl App {
             // The mode can't change during a run, and still shows the last run's after it.
             let step = match (phase.as_str(), self.mode) {
                 ("verifying", _) => "Step 1 of 2: checking every file before anything is changed",
-                ("extracting", Mode::DeleteEach | Mode::FreeAsRead) => "Step 2 of 2: unpacking",
+                ("extracting", Mode::DeleteEach | Mode::FreeAsRead | Mode::FreePerBlock) => {
+                    "Step 2 of 2: unpacking"
+                }
                 _ => "Unpacking",
             };
             ui.label(RichText::new(step).strong());
@@ -821,10 +869,18 @@ impl App {
                 ),
                 Ask::Extract if self.mode == Mode::FreeAsRead => (
                     "Free the repack while reading it?",
-                    "This frees the repack's bytes as they are read. If the run stops for any reason after \
-                     it starts (a crash, a power cut, a decoder failure), the repack is lost and must be \
-                     downloaded again. Every file is checked first, before anything is freed.\n\n\
+                    "This frees the repack's bytes as they are read. If the run stops partway (a crash, a \
+                     power cut, a decoder failure), the data file being read is partly gone: pressing Unpack \
+                     again finishes everything else and names that one file to download again. Every file is \
+                     checked first, before anything is freed.\n\n\
                      unrepack runs the decoders that came with the download.",
+                    "Unpack and free the repack",
+                ),
+                Ask::Extract if self.mode == Mode::FreePerBlock => (
+                    "Free the repack block by block?",
+                    "Each block of the repack is freed once its files are on disk. If the run stops, press \
+                     Unpack again to continue; nothing is lost. Every file is checked first, before anything \
+                     is freed.\n\nunrepack runs the decoders that came with the download.",
                     "Unpack and free the repack",
                 ),
                 Ask::Extract => (
@@ -834,15 +890,15 @@ impl App {
                     "Unpack and delete",
                 ),
                 Ask::Stop | Ask::Close if destroys => (
-                    "Stop now and lose the repack?",
-                    "Part of the repack has already been freed. Stopping now leaves a half-unpacked game \
-                     and a repack that can't be used again.",
-                    "Stop and lose the repack",
+                    "Stop now and lose part of the repack?",
+                    "The data file being read is partly freed already. Stopping now means downloading that \
+                     data file again; pressing Unpack again continues with everything else.",
+                    "Stop anyway",
                 ),
                 Ask::Stop | Ask::Close => (
                     "Stop unpacking?",
-                    "The repack is unchanged, but the install folder keeps the files unpacked so far; empty it \
-                     before trying again.",
+                    "Nothing is lost: press Unpack again, with the same repack, folder and choices, to \
+                     continue where it stopped.",
                     "Stop",
                 ),
             };
@@ -992,6 +1048,10 @@ mod tests {
         assert_eq!(
             cli_args(&r, "O", "", Mode::DeleteEach, false)[4],
             "--delete-each"
+        );
+        assert_eq!(
+            cli_args(&r, "O", "", Mode::FreePerBlock, false)[4],
+            "--free-per-block"
         );
         assert_eq!(
             parse_progress("@progress verifying 5 10"),
