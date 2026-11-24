@@ -11,11 +11,11 @@
 
 <p align="center">
   <a href="https://github.com/ArekatlaNishanthchowdary/unrepack/releases/latest"><img src="https://img.shields.io/github/v/release/ArekatlaNishanthchowdary/unrepack?style=for-the-badge&label=release&color=1f6feb" alt="Latest release" /></a>
-  <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-e8743b?style=for-the-badge" alt="MIT or Apache-2.0 licensed, except src/builtin.rs and src/tornado.rs" /></a>
+  <a href="#license"><img src="docs/badges/license.svg" alt="MIT or Apache-2.0 licensed, except src/builtin.rs and src/tornado.rs" /></a>
   <a href="https://github.com/ArekatlaNishanthchowdary/unrepack/releases"><img src="https://img.shields.io/github/downloads/ArekatlaNishanthchowdary/unrepack/total?style=for-the-badge&label=downloads&color=3fb950" alt="Downloads" /></a>
-  <a href="https://github.com/sponsors/ArekatlaNishanthchowdary"><img src="https://img.shields.io/badge/sponsor-ea4aaa?style=for-the-badge&logo=githubsponsors&logoColor=white" alt="Sponsor on GitHub" /></a>
-  <a href="https://github.com/ArekatlaNishanthchowdary/unrepack/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/ArekatlaNishanthchowdary/unrepack/ci.yml?branch=master&style=for-the-badge&label=ci" alt="CI status" /></a>
-  <img src="https://img.shields.io/badge/platform-windows-4ca571?style=for-the-badge" alt="Windows only" />
+  <a href="https://github.com/sponsors/ArekatlaNishanthchowdary"><img src="docs/badges/sponsor.svg" alt="Sponsor on GitHub" /></a>
+  <a href="https://github.com/ArekatlaNishanthchowdary/unrepack/actions/workflows/ci.yml"><img src="https://github.com/ArekatlaNishanthchowdary/unrepack/actions/workflows/ci.yml/badge.svg?branch=master" alt="CI status" /></a>
+  <img src="docs/badges/platform.svg" alt="Windows only" />
 </p>
 
 <h4 align="center">
