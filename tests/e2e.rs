@@ -857,3 +857,51 @@ fn a_rerun_another_way_is_refused() {
     assert_extracted(&out, &sample_files());
     no_leftovers(&out);
 }
+
+/// A ZIP's entries are blocks of their own: stopped partway with
+/// --free-as-read and nothing journaled, the freed entries are found on disk
+/// and the rest continue, with no fresh copy needed.
+#[test]
+fn a_zip_freed_as_read_continues_after_a_crash() {
+    const NAMES: [&str; 6] = ["f0.bin", "f1.bin", "f2.bin", "f3.bin", "f4.bin", "f5.bin"];
+    let files: Vec<File> = NAMES
+        .iter()
+        .enumerate()
+        .map(|(k, name)| {
+            let mut x = 0x9e37_79b9u32 ^ k as u32;
+            let data = (0..3 << 19)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    x as u8
+                })
+                .collect();
+            File {
+                dir: "game/data",
+                name,
+                data,
+            }
+        })
+        .collect();
+    let t = tempfile::tempdir().unwrap();
+    let dl = t.path().join("download");
+    fs::create_dir_all(&dl).unwrap();
+    let zip = dl.join("game.zip");
+    zip_of(&files, &zip);
+    let out = t.path().join("out");
+    let run = |crash: Option<&str>| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_unrepack"));
+        c.arg("extract").arg(&dl).arg("-o").arg(&out);
+        c.args(["--yes", "--free-as-read"]);
+        if let Some(x) = crash {
+            c.env("UNREPACK_TEST_CRASH", x);
+        }
+        c.output().unwrap()
+    };
+    assert!(!run(Some("block:4")).status.success());
+    ok(&run(None));
+    assert_extracted(&out, &files);
+    no_leftovers(&out);
+    assert!(!zip.exists());
+}
