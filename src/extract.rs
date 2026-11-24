@@ -1,10 +1,14 @@
 //! Decoding a FreeArc data file block by block into files, optionally
 //! freeing the archive's bytes as the first decoder consumes them.
 //!
-//! v0.1 has no resume: once a byte is freed, a crash or a decoder failure
-//! loses the data file. That is why a verify pass (decode everything, check
-//! every CRC, write nothing) runs first by default, and why a marker file
-//! next to the data file makes any later run refuse a half-consumed one.
+//! A stopped run picks up at the first block not yet on disk (see
+//! `resume`): a block is decoded whole, since the decoders can't start
+//! partway into one. So freeing a block's bytes as they are read means a
+//! crash inside it loses that block for good; `Mode::FreePerBlock` frees
+//! them only once the block is on disk. A verify pass (decode everything,
+//! check every CRC, write nothing) runs first by default when anything is
+//! freed or deleted, and a marker file next to a partly freed data file
+//! keeps anything but a rerun of the same extraction away from it.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -18,6 +22,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail, ensure};
 
 use crate::freearc::{Archive, Block};
+use crate::resume::{Journal, Mode};
 use crate::win;
 
 /// How far the reader runs ahead of the last punch: punching is a syscall
@@ -1011,11 +1016,20 @@ fn create_file(path: &Path) -> Result<File> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
+    // Anything already here is this extraction's own: the folder was checked
+    // empty when it started, so it is a crashed run's, or an earlier data
+    // file's copy, which the later one replaces.
+    match fs::remove_file(path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => {
+            return Err(e).with_context(|| format!("replacing {}", path.display()));
+        }
+        _ => {}
+    }
     OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)
-        .with_context(|| format!("creating {} (it must not exist yet)", path.display()))
+        .with_context(|| format!("creating {}", path.display()))
 }
 
 fn entries(
@@ -1061,6 +1075,9 @@ fn entries(
             }
             left -= n as u64;
             progress.add(n as u64, what);
+            if out.is_some() {
+                crate::resume::crash_point("bytes", n as u64);
+            }
         }
         let got = crc.finalize();
         ensure!(
@@ -1069,8 +1086,9 @@ fn entries(
             e.path.display(),
             e.crc
         );
-        // Flushed per file only while the input is being freed: it was half
-        // the time of a ZIP of 5,827 files. `flush` covers --delete-each.
+        // Flushed per file only while the input is freed as it is read: it
+        // was half the time of a ZIP of 5,827 files. Otherwise the journal's
+        // checkpoints flush them in batches.
         if let (Some(f), Some(p), Some(t)) = (file, part, target) {
             if sync {
                 f.sync_all()
@@ -1083,16 +1101,10 @@ fn entries(
     Ok(())
 }
 
-/// Forces the files a data file wrote onto the disk, 16 at a time, so that
-/// deleting the data file afterwards can't lose both to a power cut.
-pub fn flush(out: &Path, archive: &Archive) -> Result<()> {
-    let files: Vec<PathBuf> = archive
-        .blocks
-        .iter()
-        .flat_map(|b| &b.entries)
-        .filter(|e| !e.is_dir)
-        .map(|e| out.join(&e.path))
-        .collect();
+/// Forces `files` onto the disk, 16 at a time, so that the journal can say
+/// they are done and the input behind them can go.
+// ponytail: folders aren't flushed; NTFS journals their entries itself.
+pub fn flush(files: &[PathBuf]) -> Result<()> {
     let next = std::sync::atomic::AtomicUsize::new(0);
     std::thread::scope(|s| {
         let workers: Vec<_> = (0..16)
@@ -1115,8 +1127,35 @@ pub fn flush(out: &Path, archive: &Archive) -> Result<()> {
     })
 }
 
-/// The marker that says a data file is partly consumed and can't be used
-/// again by this version.
+/// Whether every file of `block` is in `out` already, whole: right size and
+/// CRC. Files get their name only once written and checked, so a block
+/// whose input is gone may still be done.
+pub fn on_disk(out: &Path, block: &Block) -> Result<bool> {
+    let mut buf = vec![0u8; 1 << 20];
+    for e in block.entries.iter().filter(|e| !e.is_dir) {
+        let Ok(mut f) = File::open(out.join(&e.path)) else {
+            return Ok(false);
+        };
+        if f.metadata()?.len() != e.size {
+            return Ok(false);
+        }
+        let mut crc = block.crc.hasher();
+        loop {
+            let n = f.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            crc.update(&buf[..n]);
+        }
+        if crc.finalize() != e.crc {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The marker that says a data file is partly freed, so that nothing but a
+/// rerun of the same extraction uses it again.
 pub fn marker(data: &Path) -> PathBuf {
     let mut s = data.as_os_str().to_owned();
     s.push(".unrepack-consumed");
@@ -1128,44 +1167,76 @@ pub struct Job<'a> {
     pub archive: &'a Archive,
 }
 
-/// Extracts one data file. With `consume`, its bytes are freed as they are
-/// read and the file is deleted at the end.
+/// Extracts one data file, from the first block `journal` doesn't have as
+/// done (it is data file number `f` there). With a freeing `mode`, its
+/// bytes are freed, as they are read or once each block is on disk, and
+/// the file is deleted at the end.
 pub fn run(
     job: &Job,
     dec: &Decoders,
     out: &Path,
-    consume: bool,
+    mode: Mode,
+    mut journal: Option<(&mut Journal, usize)>,
     progress: &mut Progress,
 ) -> Result<()> {
+    let frees = mode.frees();
     let file = OpenOptions::new()
         .read(true)
-        .write(consume)
+        .write(frees)
         .open(job.data)
         .with_context(|| format!("opening {}", job.data.display()))?;
-    if consume {
+    if frees {
         let m = marker(job.data);
         fs::write(
             &m,
-            "unrepack v0.1 started freeing this data file; it can't be extracted again.\n",
+            "unrepack started freeing this data file; only a rerun of that extraction can use it.\n",
         )
         .with_context(|| format!("writing {}", m.display()))?;
         win::set_sparse(&file).with_context(|| format!("making {} sparse", job.data.display()))?;
     }
+    let blocks = &job.archive.blocks;
+    let skip = journal.as_ref().map_or(0, |(j, f)| j.blocks_done(*f));
     // Blocks are sorted and don't overlap (freearc::open, zip::open).
-    let mut freed = job.archive.blocks.first().map_or(0, |b| b.start);
-    for b in &job.archive.blocks {
+    let mut freed = blocks.get(skip).map_or(0, |b| b.start);
+    for (i, b) in blocks.iter().enumerate().skip(skip) {
+        let end = b.start + b.packed;
+        let as_read = mode == Mode::FreeAsRead;
+        if as_read && let Some((j, f)) = journal.as_mut() {
+            // The first whole unit the reader frees, as `win::punch` rounds.
+            let unit = freed.min(b.start).next_multiple_of(win::UNIT);
+            if unit + win::UNIT <= end {
+                j.start_freeing(*f, i, unit)?;
+            }
+        }
         block(
             job.data,
             &file,
             b,
             dec,
             Some(out),
-            consume.then_some(&mut freed),
+            as_read.then_some(&mut freed),
             progress,
         )
         .with_context(|| format!("block '{}' of {}", b.method, job.data.display()))?;
+        crate::resume::crash_point("block", 1);
+        if let Some((j, f)) = journal.as_mut() {
+            let files = b
+                .entries
+                .iter()
+                .filter(|e| !e.is_dir)
+                .map(|e| out.join(&e.path));
+            let last = i + 1 == blocks.len();
+            if let Some(upto) = j.finished(*f, i, files, b.unpacked(), last)?
+                && mode == Mode::FreePerBlock
+            {
+                let end = blocks[upto].start + blocks[upto].packed;
+                win::punch(&file, freed, end)
+                    .with_context(|| format!("freeing {}", job.data.display()))?;
+                freed = freed.max(end / win::UNIT * win::UNIT);
+            }
+        }
     }
-    if consume {
+    if frees {
         drop(file);
         fs::remove_file(job.data).with_context(|| format!("deleting {}", job.data.display()))?;
         let _ = fs::remove_file(marker(job.data));
