@@ -1470,6 +1470,7 @@ fn extract_cmd(a: Args) -> Result<()> {
         );
         return Ok(());
     }
+    journal.lazy_end = mode == Mode::Keep;
     for (i, (f, arc)) in jobs.iter().enumerate() {
         if !journal.complete(i) {
             note!("extracting {}", f.display());

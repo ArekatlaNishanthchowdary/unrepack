@@ -97,6 +97,10 @@ pub struct Journal {
     pending_block: Option<(usize, usize)>,
     pending_bytes: u64,
     since: Instant,
+    /// Set when the repack is kept and nothing follows the last data file:
+    /// its last checkpoint isn't flushed, since the journal is deleted next.
+    /// Flushing 5,000 files there doubled a 15 s extraction.
+    pub lazy_end: bool,
 }
 
 /// Reads the journal in `out`, if there is one.
@@ -161,6 +165,7 @@ pub fn peek(out: &Path) -> Result<Option<Journal>> {
         pending_block: None,
         pending_bytes: 0,
         since: Instant::now(),
+        lazy_end: false,
     };
     // Only the last line can be cut short; anything unreadable is skipped.
     for l in lines {
@@ -234,6 +239,13 @@ impl Journal {
         bytes: u64,
         last: bool,
     ) -> Result<Option<usize>> {
+        if last && self.lazy_end && f + 1 == self.header.data.len() {
+            // The run ends here and the journal goes with it; a stop before
+            // that only redoes this batch, from the repack that is kept.
+            self.pending.clear();
+            self.pending_block = None;
+            return Ok(None);
+        }
         self.pending.extend(files);
         self.pending_block = Some((f, b));
         self.pending_bytes += bytes;

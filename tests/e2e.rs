@@ -724,7 +724,7 @@ fn zips_resume_after_a_crash_at_every_step_in_every_mode() {
             "block:1",
             "flushed:2",
             "journaled:2",
-            "journaled:3",
+            "block:3",
             "bytes:2000000",
         ] {
             // Inside an entry, freed as read: whether its bytes are gone yet
