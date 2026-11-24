@@ -1107,7 +1107,7 @@ fn entries(
 pub fn flush(files: &[PathBuf]) -> Result<()> {
     let next = std::sync::atomic::AtomicUsize::new(0);
     std::thread::scope(|s| {
-        let workers: Vec<_> = (0..16)
+        let workers: Vec<_> = (0..files.len().min(16))
             .map(|_| {
                 s.spawn(|| -> Result<()> {
                     while let Some(p) = files.get(next.fetch_add(1, Ordering::Relaxed)) {
@@ -1199,15 +1199,7 @@ pub fn run(
     // Blocks are sorted and don't overlap (freearc::open, zip::open).
     let mut freed = blocks.get(skip).map_or(0, |b| b.start);
     for (i, b) in blocks.iter().enumerate().skip(skip) {
-        let end = b.start + b.packed;
         let as_read = mode == Mode::FreeAsRead;
-        if as_read && let Some((j, f)) = journal.as_mut() {
-            // The first whole unit the reader frees, as `win::punch` rounds.
-            let unit = freed.min(b.start).next_multiple_of(win::UNIT);
-            if unit + win::UNIT <= end {
-                j.start_freeing(*f, i, unit)?;
-            }
-        }
         block(
             job.data,
             &file,

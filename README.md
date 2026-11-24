@@ -140,6 +140,8 @@ It continues block by block. A FreeArc data file is one or a few solid blocks, a
 
 With `--free-as-read`, the block being read when the run stopped may already be partly freed, and then nothing can decode it. The rerun says which data file that is. Download it again, put it in place of the old one, and run the same command: the blocks of it already extracted are skipped, and the other data files were never touched. If losing that file isn't acceptable, use `--free-per-block`: it frees a block only once its files are on disk, at the cost of more space while a block is decoded.
 
+When Setup.exe has install steps (see [Setup's install steps](#setups-install-steps)), a run that stopped during an unpack goes on from its last block, and finished steps are skipped. One that stopped while one of Setup's commands was running is refused, since a command cut off halfway can't be known to be safe to run again: extract into an empty folder again; the repack is kept in that case anyway. Resuming through Setup's steps hasn't been tried on a real repack yet.
+
 The journal only counts a block as done once its files are forced to disk, so even a power cut can't make a rerun skip a file that never got there. Unpacking is checkpointed every 1 GiB or 60 s; after a crash, at most that much is unpacked again.
 
 ### Zipped games

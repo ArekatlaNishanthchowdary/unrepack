@@ -971,6 +971,18 @@ fn extract_cmd(a: Args) -> Result<()> {
             .to_string_lossy()
             .to_lowercase()
     };
+    // The stopped run got as far as deleting every data file: only the
+    // journal is left to go.
+    if let Some(j) = prior.take() {
+        if j.header.mode.removes() && (0..files.len()).all(|i| j.complete(i) && !files[i].exists())
+        {
+            j.finish()?;
+            let _ = fs::remove_dir(a.work.clone().unwrap_or_else(|| out.join(".unrepack-work")));
+            say!("done: the extraction into {} had finished", out.display());
+            return Ok(());
+        }
+        prior = Some(j);
+    }
     // A Setup.exe next to a ZIP is some other download's: neither its steps
     // nor its decoders apply.
     let zips = zip::sniff(files.iter().find(|f| f.exists()).unwrap_or(&files[0]));
@@ -1056,10 +1068,11 @@ fn extract_cmd(a: Args) -> Result<()> {
             None => ensure!(
                 !extract::marker(f).exists(),
                 "{} was partly freed by an extraction into another folder, or by unrepack 0.2 or \
-                 older, so part of it is gone. Run that extraction again with the same output \
-                 folder, or download {} again",
+                 older, so part of it may be gone. Run that extraction again with the same output \
+                 folder; or download {} again and delete {}",
                 f.display(),
-                f.file_name().unwrap_or_default().display()
+                f.file_name().unwrap_or_default().display(),
+                extract::marker(f).display()
             ),
         }
         let arc = open_data(f).with_context(|| format!("reading the index of {}", f.display()))?;
@@ -1073,27 +1086,31 @@ fn extract_cmd(a: Args) -> Result<()> {
         }
         jobs.push((f.clone(), arc));
     }
-    // With --free-as-read, the block being read when the run stopped may be
-    // partly freed; nothing can decode it then, short of a fresh copy. If
-    // it got as far as writing all its files, it is done all the same.
-    if let Some(j) = prior.as_mut() {
+    // With --free-as-read, blocks after the last checkpoint were freed as
+    // they were read: one whose files are all on disk is done, and one that
+    // is partly freed can't be decoded again, short of a fresh copy.
+    if let Some(j) = prior.as_mut()
+        && j.header.mode == Mode::FreeAsRead
+    {
         for (i, (f, arc)) in jobs.iter().enumerate() {
-            if let Some((b, unit)) = j.freeing(i)
-                && f.exists()
-                && resume::freed_at(f, unit)?
-            {
-                if b == j.blocks_done(i) && extract::on_disk(&out, &arc.blocks[b])? {
-                    j.mark_done(i, b)?;
+            if !f.exists() {
+                continue;
+            }
+            for (k, b) in arc.blocks.iter().enumerate().skip(j.blocks_done(i)) {
+                if extract::on_disk(&out, b)? {
+                    j.mark_done(i, k)?;
                     continue;
                 }
-                let name = f.file_name().unwrap_or_default().display();
-                let done = j.blocks_done(i);
-                bail!(
-                    "{name} was being freed as it was read when the extraction stopped, so part of \
-                     it is gone; the {done} block(s) of it extracted before that are kept. Download \
-                     {name} again, put it in place of this one, and run the same command: it goes \
-                     on from there. The other data files are fine."
-                );
+                if resume::freed(f, b.start, b.start + b.packed)? {
+                    let name = f.file_name().unwrap_or_default().display();
+                    bail!(
+                        "{name} was being freed as it was read when the extraction stopped, so part \
+                         of it is gone; the {k} block(s) of it extracted before that are kept. \
+                         Download {name} again, put it in place of this one, and run the same \
+                         command: it goes on from there. The other data files are fine."
+                    );
+                }
+                break;
             }
         }
     }
@@ -1159,6 +1176,21 @@ fn extract_cmd(a: Args) -> Result<()> {
         });
     }
 
+    // A command of Setup's that was cut off may have left anything behind,
+    // and nothing says running it twice is safe. The repack is kept on this
+    // path, so starting over only costs time.
+    if let (Some(j), Some(steps)) = (&prior, &steps)
+        && let Some(i) = j.interrupted_step()
+    {
+        let what = match steps.get(i) {
+            Some(recipe::Step::Run { exe, .. }) => exe.as_str(),
+            _ => "a command",
+        };
+        bail!(
+            "the extraction stopped while Setup's step {what} was running, which can't be known to \
+             be safe to run twice. Extract into an empty folder again; the repack is unchanged."
+        );
+    }
     // Everything refusable is refused here, before anything changes.
     let mut seen = std::collections::HashMap::new();
     for (f, arc) in &jobs {
@@ -1329,25 +1361,6 @@ fn extract_cmd(a: Args) -> Result<()> {
             bail!("stopped; nothing was changed");
         }
     }
-    let mut journal = match prior {
-        Some(j) => j,
-        None => resume::create(
-            &out,
-            resume::Header {
-                mode,
-                data: jobs
-                    .iter()
-                    .map(|(f, a)| -> Result<_> {
-                        Ok(resume::DataFile {
-                            path: f.clone(),
-                            len: fs::metadata(f)?.len(),
-                            blocks: a.blocks.len(),
-                        })
-                    })
-                    .collect::<Result<_>>()?,
-            },
-        )?,
-    };
     fs::create_dir_all(&dec.work).with_context(|| format!("creating {}", dec.work.display()))?;
 
     // Setup's steps up to its first unpack into the game folder, and every
@@ -1419,22 +1432,48 @@ fn extract_cmd(a: Args) -> Result<()> {
         );
         note!("extracting");
     }
+    // Only now, with nothing changed before, is there anything to continue.
+    let mut journal = match prior {
+        Some(j) => j,
+        None => resume::create(
+            &out,
+            resume::Header {
+                mode,
+                data: jobs
+                    .iter()
+                    .map(|(f, a)| -> Result<_> {
+                        Ok(resume::DataFile {
+                            path: f.clone(),
+                            len: fs::metadata(f)?.len(),
+                            blocks: a.blocks.len(),
+                        })
+                    })
+                    .collect::<Result<_>>()?,
+            },
+        )?,
+    };
     let mut p = Progress::new(total_out);
     if let (Some(steps), Some(pl)) = (&steps, &places) {
         // What Setup installs into the game folder itself: FitGirl's hash
-        // lists, one per component, which its last step joins up.
-        if let Some(setup) = setup_in(&src_dir) {
+        // lists, one per component, which its last step joins up. Once a
+        // step is done, a later one may have moved or deleted them.
+        if let Some(setup) = setup_in(&src_dir)
+            && journal.steps_done() == 0
+        {
             let n = inno::carve_app(&setup, Some(&out), &|c| chosen_component(steps, &jobs, c))?;
             say!(
                 "copied {} file(s) Setup.exe puts in the game folder itself",
                 n.len()
             );
         }
-        // A step the stopped run was in is done again: an unpack goes on
-        // from its last block on disk, a command runs again from the start.
+        // An unpack the stopped run was in goes on from its last block on
+        // disk; a command it was running was refused above.
         for (i, s) in steps.iter().enumerate().skip(first) {
             if matches!(s, recipe::Step::Extract { tools: true, .. }) || i < journal.steps_done() {
                 continue;
+            }
+            if matches!(s, recipe::Step::Run { .. }) {
+                journal.begin_step(i)?;
             }
             setup_step(s, pl, &tools, &jobs, &dec, Some(&mut journal), &mut p)
                 .inspect_err(|_| carved.iter().for_each(Carved::keep))?;

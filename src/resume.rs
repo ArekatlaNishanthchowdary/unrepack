@@ -6,14 +6,18 @@
 //!
 //! - `done <f> <b>`: blocks 0 to `b` of data file `f` are on disk. Written at
 //!   checkpoints, only after the files of those blocks are flushed.
-//! - `freeing <f> <b> <unit>`: with `--free-as-read`, written before block
-//!   `b`'s packed bytes start being freed; `unit` is the first 1 MiB that
-//!   goes. If it reads as zeros on a rerun, the block's input is gone.
+//! - `begin <i>`: Setup's install step `i`, a command, has started.
 //! - `step <i>`: Setup's install step `i` is finished.
 //!
 //! A line cut short by a crash is ignored. The rule: the journal never says
 //! a block is done before its files are on disk, and no packed byte of a
 //! block is freed by `--free-per-block` before the journal says it is done.
+//!
+//! `--free-as-read` frees blocks the journal doesn't have yet, so a rerun
+//! looks at the blocks after the last checkpoint itself: one whose files
+//! are all there with the right CRCs is done (each was flushed before it got
+//! its name), one whose start reads as freed is lost, and the first that is
+//! neither is decoded again.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -90,9 +94,8 @@ pub struct Journal {
     /// Per data file, how many of its blocks are on disk.
     done: Vec<usize>,
     steps: usize,
-    /// Per data file, the last block that started being freed, and the
-    /// first unit it freed.
-    freeing: Vec<Option<(usize, u64)>>,
+    /// The last command step that started.
+    begun: Option<usize>,
     pending: Vec<PathBuf>,
     pending_block: Option<(usize, usize)>,
     pending_bytes: u64,
@@ -160,7 +163,7 @@ pub fn peek(out: &Path) -> Result<Option<Journal>> {
         header: Header { mode, data },
         done: vec![0; n],
         steps: 0,
-        freeing: vec![None; n],
+        begun: None,
         pending: Vec::new(),
         pending_block: None,
         pending_bytes: 0,
@@ -175,9 +178,7 @@ pub fn peek(out: &Path) -> Result<Option<Journal>> {
             ("done", Some(f), Some(b), None) if (f as usize) < n => {
                 j.done[f as usize] = j.done[f as usize].max(b as usize + 1);
             }
-            ("freeing", Some(f), Some(b), Some(u)) if (f as usize) < n => {
-                j.freeing[f as usize] = Some((b as usize, u));
-            }
+            ("begin", Some(i), None, None) => j.begun = Some(i as usize),
             ("step", Some(i), None, None) => j.steps = j.steps.max(i as usize + 1),
             _ => {}
         }
@@ -208,11 +209,9 @@ impl Journal {
     pub fn steps_done(&self) -> usize {
         self.steps
     }
-    /// The block of data file `f` that was being freed as it was read when
-    /// the last run stopped, and the first unit it freed; `None` once that
-    /// block is done.
-    pub fn freeing(&self, f: usize) -> Option<(usize, u64)> {
-        self.freeing[f].filter(|&(b, _)| b >= self.done[f])
+    /// The command step that was running when the last run stopped.
+    pub fn interrupted_step(&self) -> Option<usize> {
+        self.begun.filter(|&i| i >= self.steps)
     }
 
     fn append(&mut self, line: &str) -> Result<()> {
@@ -222,9 +221,10 @@ impl Journal {
             .with_context(|| format!("writing {}", self.path.display()))
     }
 
-    pub fn start_freeing(&mut self, f: usize, b: usize, unit: u64) -> Result<()> {
-        self.append(&format!("freeing {f} {b} {unit}"))?;
-        self.freeing[f] = Some((b, unit));
+    /// Setup's command step `i` is starting.
+    pub fn begin_step(&mut self, i: usize) -> Result<()> {
+        self.append(&format!("begin {i}"))?;
+        self.begun = Some(i);
         Ok(())
     }
 
@@ -249,18 +249,12 @@ impl Journal {
         self.pending.extend(files);
         self.pending_block = Some((f, b));
         self.pending_bytes += bytes;
-        // The resume tests checkpoint after every block. Freed as read, a
-        // finished block can't be decoded again, so the journal must say so
-        // at once; its files are each flushed already.
+        // The resume tests checkpoint after every block.
         let every = std::env::var("UNREPACK_TEST_CHECKPOINT")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(CHECKPOINT_BYTES);
-        if last
-            || self.header.mode == Mode::FreeAsRead
-            || self.pending_bytes >= every
-            || self.since.elapsed() >= CHECKPOINT_TIME
-        {
+        if last || self.pending_bytes >= every || self.since.elapsed() >= CHECKPOINT_TIME {
             return self.checkpoint();
         }
         Ok(None)
@@ -270,7 +264,11 @@ impl Journal {
         let Some((f, b)) = self.pending_block.take() else {
             return Ok(None);
         };
-        crate::extract::flush(&std::mem::take(&mut self.pending))?;
+        let files = std::mem::take(&mut self.pending);
+        // Freed as read, each file was flushed as it was finished.
+        if self.header.mode != Mode::FreeAsRead {
+            crate::extract::flush(&files)?;
+        }
         crash_point("flushed", 1);
         self.append(&format!("done {f} {b}"))?;
         self.done[f] = b + 1;
@@ -300,18 +298,30 @@ impl Journal {
     }
 }
 
-/// Whether the 1 MiB of `data` at `unit` is all zeros, as a freed range
-/// reads. Packed data never holds that many zeros in a row, so this tells a
-/// partly freed data file from a fresh copy of it.
+/// Whether any of the packed bytes `start..end` of `data` are freed. Freeing
+/// goes front to back in whole units (`win::punch`), so if any of a block's
+/// bytes went, the unit holding its start or the one after it did, and a
+/// freed unit reads as all zeros. Packed data never holds that many zeros
+/// in a row, so this also tells a partly freed file from a fresh copy.
 // ponytail: a `storing` block of zeros would read as freed; compressed
 // repack data doesn't, and a false "freed" only asks for a fresh download.
-pub fn freed_at(data: &Path, unit: u64) -> Result<bool> {
+pub fn freed(data: &Path, start: u64, end: u64) -> Result<bool> {
     let mut f = File::open(data).with_context(|| format!("opening {}", data.display()))?;
-    f.seek(SeekFrom::Start(unit))?;
+    let len = f.metadata()?.len();
+    let first = start / win::UNIT * win::UNIT;
     let mut buf = vec![0u8; win::UNIT as usize];
-    f.read_exact(&mut buf)
-        .with_context(|| format!("reading {}", data.display()))?;
-    Ok(buf.iter().all(|&b| b == 0))
+    for unit in [first, first + win::UNIT] {
+        if unit >= end || unit + win::UNIT > len {
+            break;
+        }
+        f.seek(SeekFrom::Start(unit))?;
+        f.read_exact(&mut buf)
+            .with_context(|| format!("reading {}", data.display()))?;
+        if buf.iter().all(|&b| b == 0) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// For the resume tests: `UNREPACK_TEST_CRASH=<point>:<n>` aborts the run,
@@ -359,11 +369,11 @@ mod tests {
             },
         )
         .unwrap();
-        j.start_freeing(0, 1, 1 << 20).unwrap();
         j.finished(0, 0, [], 5, false).unwrap();
         assert_eq!(j.finished(0, 1, [], 5, true).unwrap(), Some(1));
-        j.start_freeing(1, 0, 2 << 20).unwrap();
+        j.begin_step(3).unwrap();
         j.step_done(3).unwrap();
+        j.begin_step(5).unwrap();
         drop(j);
         let mut f = OpenOptions::new()
             .append(true)
@@ -385,9 +395,8 @@ mod tests {
         assert!(j.complete(0) && j.complete(1));
         assert_eq!(j.blocks_done(0), 2);
         assert_eq!(j.blocks_done(1), 1);
-        assert_eq!(j.freeing(0), None, "block 1 is done");
-        assert_eq!(j.freeing(1), None, "block 0 is done");
         assert_eq!(j.steps_done(), 4);
+        assert_eq!(j.interrupted_step(), Some(5));
         j.finish().unwrap();
         assert!(peek(dir.path()).unwrap().is_none());
     }

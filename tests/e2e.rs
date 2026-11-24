@@ -408,6 +408,10 @@ fn a_bad_crc_stops_the_verify_pass_before_anything_is_freed() {
     );
     assert_eq!(fs::read(&arc).unwrap(), before, "archive untouched");
     assert!(!t.path().join("data1.doi.unrepack-consumed").exists());
+    assert!(
+        !out.join(".unrepack-resume").exists(),
+        "nothing changed, so nothing to continue"
+    );
 }
 
 #[test]
