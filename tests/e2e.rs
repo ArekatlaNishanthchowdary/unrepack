@@ -408,6 +408,10 @@ fn a_bad_crc_stops_the_verify_pass_before_anything_is_freed() {
     );
     assert_eq!(fs::read(&arc).unwrap(), before, "archive untouched");
     assert!(!t.path().join("data1.doi.unrepack-consumed").exists());
+    assert!(
+        !out.join(".unrepack-resume").exists(),
+        "nothing changed, so nothing to continue"
+    );
 }
 
 #[test]
@@ -641,4 +645,263 @@ fn a_gap_in_the_numbering_is_refused() {
     );
     assert!(!out.exists());
     assert_eq!(fs::read(t.path().join("data1.doi")).unwrap(), before);
+}
+
+/// Zips `files` into `zip` with Windows' own Compress-Archive.
+fn zip_of(files: &[File], zip: &Path) {
+    let src = tempfile::tempdir().unwrap();
+    for f in files {
+        fs::create_dir_all(src.path().join(f.dir)).unwrap();
+        fs::write(src.path().join(f.dir).join(f.name), &f.data).unwrap();
+    }
+    let ps = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Compress-Archive -Path $env:SRC -DestinationPath $env:ZIP",
+        ])
+        .env("SRC", src.path().join("*"))
+        .env("ZIP", zip)
+        .status()
+        .unwrap();
+    assert!(ps.success());
+}
+
+/// Runs `args` with `UNREPACK_TEST_CRASH=<crash>`, which must stop it, and
+/// returns what running them again without it gives. Both checkpoint after
+/// every block, so a rerun has done blocks to skip.
+fn crash_then_rerun(args: &[&std::ffi::OsStr], crash: &str) -> std::process::Output {
+    let run = |crash: Option<&str>| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_unrepack"));
+        c.args(args).env("UNREPACK_TEST_CHECKPOINT", "1");
+        if let Some(x) = crash {
+            c.env("UNREPACK_TEST_CRASH", x);
+        }
+        c.output().unwrap()
+    };
+    let o = run(Some(crash));
+    assert!(
+        !o.status.success(),
+        "{crash}: the run should have stopped\n{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    run(None)
+}
+
+fn no_leftovers(out: &Path) {
+    assert!(
+        !out.join(".unrepack-resume").exists(),
+        "journal left behind"
+    );
+    let mut stack = vec![out.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in fs::read_dir(d).unwrap() {
+            let p = e.unwrap().path();
+            assert!(
+                !p.to_string_lossy().ends_with(".unrepack-part"),
+                "{} left behind",
+                p.display()
+            );
+            if p.is_dir() {
+                stack.push(p);
+            }
+        }
+    }
+}
+
+/// Two ZIPs (one block per entry), stopped at each step of a block and of a
+/// checkpoint, in every mode: the rerun finishes the same tree.
+#[test]
+fn zips_resume_after_a_crash_at_every_step_in_every_mode() {
+    let files = sample_files();
+    let template = tempfile::tempdir().unwrap();
+    zip_of(&files[..2], &template.path().join("a.zip"));
+    zip_of(&files[2..], &template.path().join("b.zip"));
+    // a.zip's two files are blocks 1-2 and checkpoints 1-2; b.zip's are 3-4.
+    for mode in [
+        "--yes",
+        "--delete-each",
+        "--free-as-read",
+        "--free-per-block",
+    ] {
+        for crash in [
+            "block:1",
+            "flushed:2",
+            "journaled:2",
+            "block:3",
+            "bytes:2000000",
+        ] {
+            // Inside an entry, freed as read: whether its bytes are gone yet
+            // depends on how far the decoder read ahead. The FreeArc tests
+            // below cover both outcomes.
+            if mode == "--free-as-read" && crash.starts_with("bytes") {
+                continue;
+            }
+            let t = tempfile::tempdir().unwrap();
+            let dl = t.path().join("download");
+            fs::create_dir_all(&dl).unwrap();
+            for z in ["a.zip", "b.zip"] {
+                fs::copy(template.path().join(z), dl.join(z)).unwrap();
+            }
+            let out = t.path().join("out");
+            let args: Vec<&std::ffi::OsStr> = vec![
+                "extract".as_ref(),
+                dl.as_os_str(),
+                "-o".as_ref(),
+                out.as_os_str(),
+                "--yes".as_ref(),
+                mode.as_ref(),
+            ];
+            let o = crash_then_rerun(&args, crash);
+            ok(&o);
+            let said = String::from_utf8_lossy(&o.stdout);
+            assert!(
+                said.contains("continuing the extraction"),
+                "{mode} {crash}: {said}"
+            );
+            assert_extracted(&out, &files);
+            no_leftovers(&out);
+            for z in ["a.zip", "b.zip"] {
+                assert_eq!(dl.join(z).exists(), mode == "--yes", "{mode} {crash}: {z}");
+            }
+        }
+    }
+}
+
+/// The run stops after the block's bytes were freed as they were read: the
+/// rerun refuses, naming the file, and finishes once a fresh copy is there.
+#[test]
+fn a_block_freed_as_read_when_the_run_stopped_needs_a_fresh_copy() {
+    let t = tempfile::tempdir().unwrap();
+    let arc = t.path().join("data1.doi");
+    write_archive(&arc, "storing", &sample_files(), false);
+    let out = t.path().join("out");
+    let args: Vec<&std::ffi::OsStr> = vec![
+        "extract".as_ref(),
+        arc.as_os_str(),
+        "-o".as_ref(),
+        out.as_os_str(),
+        "--yes".as_ref(),
+        "--free-as-read".as_ref(),
+    ];
+    // The whole block is read, so freed, before its last bytes are written.
+    let total: usize = sample_files().iter().map(|f| f.data.len()).sum();
+    let o = crash_then_rerun(&args, &format!("bytes:{total}"));
+    assert!(!o.status.success());
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("Download data1.doi again"), "{err}");
+    write_archive(&arc, "storing", &sample_files(), false);
+    ok(&unrepack(&args));
+    assert_extracted(&out, &sample_files());
+    no_leftovers(&out);
+    assert!(!arc.exists());
+    assert!(!t.path().join("data1.doi.unrepack-consumed").exists());
+}
+
+/// The same stop with --free-per-block loses nothing.
+#[test]
+fn freed_per_block_a_crash_inside_the_block_loses_nothing() {
+    let t = tempfile::tempdir().unwrap();
+    let arc = t.path().join("data1.doi");
+    write_archive(&arc, "storing", &sample_files(), false);
+    let out = t.path().join("out");
+    let args: Vec<&std::ffi::OsStr> = vec![
+        "extract".as_ref(),
+        arc.as_os_str(),
+        "-o".as_ref(),
+        out.as_os_str(),
+        "--yes".as_ref(),
+        "--free-per-block".as_ref(),
+    ];
+    let total: usize = sample_files().iter().map(|f| f.data.len()).sum();
+    ok(&crash_then_rerun(&args, &format!("bytes:{total}")));
+    assert_extracted(&out, &sample_files());
+    no_leftovers(&out);
+    assert!(!arc.exists());
+}
+
+/// A stopped extraction is only continued as it was started.
+#[test]
+fn a_rerun_another_way_is_refused() {
+    let t = tempfile::tempdir().unwrap();
+    let arc = t.path().join("data1.doi");
+    write_archive(&arc, "storing", &sample_files(), false);
+    let other = t.path().join("other.doi");
+    write_archive(&other, "storing", &sample_files(), false);
+    let out = t.path().join("out");
+    let run = |input: &Path, extra: &[&str], crash: Option<&str>| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_unrepack"));
+        c.arg("extract").arg(input).arg("-o").arg(&out).arg("--yes");
+        c.args(extra);
+        if let Some(x) = crash {
+            c.env("UNREPACK_TEST_CRASH", x);
+        }
+        c.output().unwrap()
+    };
+    assert!(!run(&arc, &[], Some("bytes:1000")).status.success());
+    let o = run(&arc, &["--delete-each"], None);
+    assert!(!o.status.success());
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("run it again the same way"),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let o = run(&other, &[], None);
+    assert!(!o.status.success());
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("other data files"),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    ok(&run(&arc, &[], None));
+    assert_extracted(&out, &sample_files());
+    no_leftovers(&out);
+}
+
+/// A ZIP's entries are blocks of their own: stopped partway with
+/// --free-as-read and nothing journaled, the freed entries are found on disk
+/// and the rest continue, with no fresh copy needed.
+#[test]
+fn a_zip_freed_as_read_continues_after_a_crash() {
+    const NAMES: [&str; 6] = ["f0.bin", "f1.bin", "f2.bin", "f3.bin", "f4.bin", "f5.bin"];
+    let files: Vec<File> = NAMES
+        .iter()
+        .enumerate()
+        .map(|(k, name)| {
+            let mut x = 0x9e37_79b9u32 ^ k as u32;
+            let data = (0..3 << 19)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    x as u8
+                })
+                .collect();
+            File {
+                dir: "game/data",
+                name,
+                data,
+            }
+        })
+        .collect();
+    let t = tempfile::tempdir().unwrap();
+    let dl = t.path().join("download");
+    fs::create_dir_all(&dl).unwrap();
+    let zip = dl.join("game.zip");
+    zip_of(&files, &zip);
+    let out = t.path().join("out");
+    let run = |crash: Option<&str>| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_unrepack"));
+        c.arg("extract").arg(&dl).arg("-o").arg(&out);
+        c.args(["--yes", "--free-as-read"]);
+        if let Some(x) = crash {
+            c.env("UNREPACK_TEST_CRASH", x);
+        }
+        c.output().unwrap()
+    };
+    assert!(!run(Some("block:4")).status.success());
+    ok(&run(None));
+    assert_extracted(&out, &files);
+    no_leftovers(&out);
+    assert!(!zip.exists());
 }

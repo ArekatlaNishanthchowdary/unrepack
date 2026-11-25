@@ -79,6 +79,8 @@ fn sizes(record: &[u8], mut extra: &[u8]) -> Option<(u64, u64, u64)> {
 
 pub fn open(path: &Path) -> Result<Archive> {
     let mut f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    // Partly freed by an extraction that stopped (`extract::run`).
+    let freed = crate::extract::marker(path).exists();
     let len = f.metadata()?.len();
     let tail_len = len.min(22 + 0xFFFF + 20);
     let t = read_at(&mut f, len - tail_len, tail_len)?;
@@ -169,12 +171,18 @@ pub fn open(path: &Path) -> Result<Archive> {
         let path = safe_path(b"", raw)?;
         // Where the data starts is only in the local header.
         let lh = read_at(&mut f, offset, 30).with_context(|| format!("reading {name}'s header"))?;
-        ensure!(
-            u32_at(&lh, 0) == Some(LFH),
-            "{name}'s header isn't where the index says"
-        );
-        let start =
-            offset + 30 + u64::from(u16_at(&lh, 26).unwrap()) + u64::from(u16_at(&lh, 28).unwrap());
+        // An entry --free-as-read already freed reads as zeros. A rerun only
+        // checks such a block's files on disk, or finds it lost, so where its
+        // data started doesn't matter.
+        let start = if freed && lh.iter().all(|&b| b == 0) {
+            offset + 30 + n as u64
+        } else {
+            ensure!(
+                u32_at(&lh, 0) == Some(LFH),
+                "{name}'s header isn't where the index says"
+            );
+            offset + 30 + u64::from(u16_at(&lh, 26).unwrap()) + u64::from(u16_at(&lh, 28).unwrap())
+        };
         found.push((
             offset,
             Block {

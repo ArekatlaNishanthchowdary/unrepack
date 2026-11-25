@@ -10,6 +10,7 @@ mod freearc;
 mod ifps;
 mod inno;
 mod recipe;
+mod resume;
 mod tornado;
 mod win;
 mod zip;
@@ -22,6 +23,7 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail, ensure};
 
 use extract::{Decoders, Job, Progress, human};
+use resume::{Journal, Mode};
 
 const USAGE: &str = concat!(
     "unrepack ",
@@ -48,14 +50,21 @@ Options:
   --work <dir>      where decoders run and keep temp files (default: <output>\\.unrepack-work)
   --log <file>      also write every message and a progress line every 5 s to <file>
   --check           plan only: say whether it fits, change nothing
-  --delete-each     delete each data file once all of it is extracted (crash safe)
-  --free-as-read    free each data file's bytes as they are decoded. NOT crash safe in
-                    this version: if the run stops after the first freed byte, the repack is lost
+  --delete-each     delete each data file once all of it is extracted
+  --free-as-read    free each data file's bytes as they are decoded: the least space. A
+                    crash partway through a block loses that data file's freed part; a
+                    rerun finishes the rest and asks for that one file again
+  --free-per-block  free a block's bytes only once its files are on disk: a crash loses
+                    nothing, but a data file that is one block (most DODI repacks) frees
+                    nothing until it is done, like --delete-each
   --verify          decode everything once, checking every CRC, before writing anything.
-                    On by default with --free-as-read and --delete-each, where it stops a
-                    bad repack before any of it is gone; it doubles the time
+                    On by default when freeing or deleting, where it stops a bad repack
+                    before any of it is gone; it doubles the time
   --no-verify       skip that pass even when freeing or deleting (removes the safety net)
   --yes             don't ask before freeing or deleting
+
+A stopped extraction (crash, power cut, closed window, decoder error) continues where
+it left off when the same command is run again: the output folder remembers it.
 
 The repack's decoders are programs that came with the download; unrepack runs them.
 "
@@ -72,6 +81,7 @@ struct Args {
     check: bool,
     delete_each: bool,
     free_as_read: bool,
+    free_per_block: bool,
     verify: bool,
     yes: bool,
 }
@@ -93,6 +103,7 @@ fn parse() -> Result<Args> {
         check: false,
         delete_each: false,
         free_as_read: false,
+        free_per_block: false,
         verify: false,
         yes: false,
     };
@@ -112,6 +123,7 @@ fn parse() -> Result<Args> {
             "--check" => a.check = true,
             "--delete-each" => a.delete_each = true,
             "--free-as-read" => a.free_as_read = true,
+            "--free-per-block" => a.free_per_block = true,
             "--verify" => verify = Some(true),
             "--no-verify" => verify = Some(false),
             "--yes" | "-y" => a.yes = true,
@@ -122,7 +134,15 @@ fn parse() -> Result<Args> {
     // Keeping the repack, a bad block only means rerunning into an empty
     // folder, and the MD5 check already caught damaged downloads; decoding
     // everything twice isn't worth it there.
-    a.verify = verify.unwrap_or(a.delete_each || a.free_as_read);
+    ensure!(
+        [a.delete_each, a.free_as_read, a.free_per_block]
+            .iter()
+            .filter(|&&x| x)
+            .count()
+            <= 1,
+        "choose one of --delete-each, --free-as-read and --free-per-block"
+    );
+    a.verify = verify.unwrap_or(a.delete_each || a.free_as_read || a.free_per_block);
     Ok(a)
 }
 
@@ -315,6 +335,7 @@ fn setup_step(
     tools: &[(PathBuf, String, freearc::Archive)],
     jobs: &[(PathBuf, freearc::Archive)],
     dec: &Decoders,
+    journal: Option<&mut Journal>,
     p: &mut Progress,
 ) -> Result<()> {
     let named = |f: &Path, data: &str| {
@@ -345,7 +366,8 @@ fn setup_step(
             )?;
         }
         recipe::Step::Extract { data, .. } => {
-            if let Some((f, arc)) = jobs.iter().find(|(f, _)| named(f, data)) {
+            if let Some(i) = jobs.iter().position(|(f, _)| named(f, data)) {
+                let (f, arc) = &jobs[i];
                 note!("extracting {}", f.display());
                 extract::run(
                     &Job {
@@ -354,7 +376,8 @@ fn setup_step(
                     },
                     dec,
                     &pl.app,
-                    false,
+                    Mode::Keep,
+                    journal.map(|j| (j, i)),
                     p,
                 )?;
             }
@@ -383,11 +406,11 @@ fn setup_step(
 fn extract_tools(job: &Job, sub: &str, dec: &Decoders, tmp: &Path) -> Result<()> {
     let mut p = Progress::new(job.archive.unpacked());
     if sub.is_empty() {
-        return extract::run(job, dec, tmp, false, &mut p);
+        return extract::run(job, dec, tmp, Mode::Keep, None, &mut p);
     }
     let stage = tmp.join(".unrepack-stage");
     let _ = fs::remove_dir_all(&stage);
-    extract::run(job, dec, &stage, false, &mut p)?;
+    extract::run(job, dec, &stage, Mode::Keep, None, &mut p)?;
     let from = stage.join(sub);
     for e in fs::read_dir(&from)
         .with_context(|| format!("{} has no {sub} folder", job.data.display()))?
@@ -783,27 +806,48 @@ fn list(path: &Path) -> Result<()> {
 
 /// What the disk must have free, from a replay of the run: each data file
 /// adds its output, rounded up to 4 KiB per file; with --free-as-read it gives
-/// back its packed bytes as it goes, with --delete-each once it is done.
+/// back its packed bytes as it goes, with --free-per-block as each block is
+/// done, with --delete-each once the data file is done.
 /// ponytail: --free-as-read assumes output and freed input keep pace; a
 /// decoder that runs far ahead needs more, and the run pauses on a full disk.
-fn space_needed(jobs: &[(PathBuf, freearc::Archive)], consume: bool, delete_each: bool) -> u64 {
+fn space_needed(jobs: &[(PathBuf, freearc::Archive)], mode: Mode) -> u64 {
+    let size = |b: &freearc::Block| -> u64 {
+        b.entries
+            .iter()
+            .map(|e| e.size.next_multiple_of(4096))
+            .sum()
+    };
     let mut written = 0u64;
     let mut freed = 0u64;
     let mut peak = 0u64;
     for (_, a) in jobs {
-        let out: u64 = a
-            .blocks
-            .iter()
-            .flat_map(|b| &b.entries)
-            .map(|e| e.size.next_multiple_of(4096))
-            .sum();
-        if consume {
-            peak = peak.max((written + out).saturating_sub(freed + a.len));
-        } else {
-            peak = peak.max((written + out).saturating_sub(freed));
+        let out: u64 = a.blocks.iter().map(size).sum();
+        match mode {
+            Mode::FreeAsRead => {
+                peak = peak.max((written + out).saturating_sub(freed + a.len));
+            }
+            Mode::FreePerBlock => {
+                // Blocks are freed at checkpoints, as `Journal::finished`
+                // makes them (the 60 s ones only come sooner).
+                let (mut w, mut f) = (written, freed);
+                let (mut pending_out, mut pending_in) = (0, 0);
+                for (k, b) in a.blocks.iter().enumerate() {
+                    w += size(b);
+                    peak = peak.max(w.saturating_sub(f));
+                    pending_out += b.unpacked();
+                    pending_in += b.packed;
+                    if pending_out >= resume::CHECKPOINT_BYTES || k + 1 == a.blocks.len() {
+                        f += pending_in;
+                        (pending_out, pending_in) = (0, 0);
+                    }
+                }
+            }
+            Mode::Keep | Mode::DeleteEach => {
+                peak = peak.max((written + out).saturating_sub(freed));
+            }
         }
         written += out;
-        if consume || delete_each {
+        if mode.removes() {
             freed += a.len;
         }
     }
@@ -836,6 +880,34 @@ fn md5_list(text: &str) -> Vec<(String, String)> {
 /// and some decoders then hang instead of failing (CONTROL's rzw did). A
 /// damaged language or extra is left out, as an incomplete one is; a damaged
 /// game file stops the run.
+/// The data files of the extraction that stopped, once the inputs given now
+/// are seen to be the same: those files, or the folder they are in. Some of
+/// them may be deleted by now, so the journal's list stands in for a scan.
+fn resumed_files(j: &Journal, inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let key = |p: &Path| -> Result<String> {
+        Ok(std::path::absolute(p)?
+            .to_string_lossy()
+            .trim_end_matches('\\')
+            .to_lowercase())
+    };
+    let mut known = Vec::new();
+    for d in &j.header.data {
+        known.push(key(&d.path)?);
+        if let Some(dir) = d.path.parent() {
+            known.push(key(dir)?);
+        }
+    }
+    for i in inputs {
+        ensure!(
+            known.contains(&key(i)?),
+            "the output folder holds an extraction that stopped, of other data files than {}; \
+             run it again with the same ones, or extract into an empty folder",
+            i.display()
+        );
+    }
+    Ok(j.header.data.iter().map(|d| d.path.clone()).collect())
+}
+
 fn md5_check(files: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
     let dir = files[0].parent().unwrap_or(Path::new(".")).join("MD5");
     let want: std::collections::HashMap<String, String> = fs::read_dir(&dir)
@@ -883,9 +955,15 @@ fn extract_cmd(a: Args) -> Result<()> {
         .out
         .clone()
         .context("say where to extract with -o <folder>")?;
+    let out = std::path::absolute(&out)?;
     win::watch_memory();
-    let files = data_files(&a.inputs)?;
-    let files = md5_check(files)?;
+    // An extraction that stopped left its journal in the output folder; it
+    // names the data files, some of which may be deleted by now.
+    let mut prior = resume::peek(&out)?;
+    let files = match &prior {
+        Some(j) => resumed_files(j, &a.inputs)?,
+        None => md5_check(data_files(&a.inputs)?)?,
+    };
     let src_dir = files[0].parent().map(Path::to_path_buf).unwrap_or_default();
     let lname = |p: &Path| {
         p.file_name()
@@ -893,9 +971,21 @@ fn extract_cmd(a: Args) -> Result<()> {
             .to_string_lossy()
             .to_lowercase()
     };
+    // The stopped run got as far as deleting every data file: only the
+    // journal is left to go.
+    if let Some(j) = prior.take() {
+        if j.header.mode.removes() && (0..files.len()).all(|i| j.complete(i) && !files[i].exists())
+        {
+            j.finish()?;
+            let _ = fs::remove_dir(a.work.clone().unwrap_or_else(|| out.join(".unrepack-work")));
+            say!("done: the extraction into {} had finished", out.display());
+            return Ok(());
+        }
+        prior = Some(j);
+    }
     // A Setup.exe next to a ZIP is some other download's: neither its steps
     // nor its decoders apply.
-    let zips = zip::sniff(&files[0]);
+    let zips = zip::sniff(files.iter().find(|f| f.exists()).unwrap_or(&files[0]));
     let steps = if zips { None } else { recipe_for(&src_dir)? };
     // Archives Setup unpacks into its temp folder for later steps: (file,
     // the folder in it that's wanted, index).
@@ -956,19 +1046,76 @@ fn extract_cmd(a: Args) -> Result<()> {
         }
     };
     let mut jobs = Vec::new();
-    for f in &files {
-        ensure!(
-            !extract::marker(f).exists(),
-            "{} was partly freed by an earlier run, which v0.1 can't continue. Its data is gone; \
-             the repack has to be downloaded again.",
-            f.display()
-        );
+    for (i, f) in files.iter().enumerate() {
+        match &prior {
+            Some(j) if j.complete(i) && !f.exists() => {
+                // Extracted, then deleted: nothing left to read.
+                let d = &j.header.data[i];
+                jobs.push((
+                    f.clone(),
+                    freearc::Archive {
+                        len: d.len,
+                        blocks: Vec::new(),
+                    },
+                ));
+                continue;
+            }
+            Some(_) => ensure!(
+                f.exists(),
+                "{} is missing, and the extraction that stopped hadn't finished it",
+                f.display()
+            ),
+            None => ensure!(
+                !extract::marker(f).exists(),
+                "{} was partly freed by an extraction into another folder, or by unrepack 0.2 or \
+                 older, so part of it may be gone. Run that extraction again with the same output \
+                 folder; or download {} again and delete {}",
+                f.display(),
+                f.file_name().unwrap_or_default().display(),
+                extract::marker(f).display()
+            ),
+        }
         let arc = open_data(f).with_context(|| format!("reading the index of {}", f.display()))?;
+        if let Some(j) = &prior {
+            let d = &j.header.data[i];
+            ensure!(
+                fs::metadata(f)?.len() == d.len && arc.blocks.len() == d.blocks,
+                "{} isn't the file the stopped extraction was reading",
+                f.display()
+            );
+        }
         jobs.push((f.clone(), arc));
+    }
+    // With --free-as-read, blocks after the last checkpoint were freed as
+    // they were read: one whose files are all on disk is done, and one that
+    // is partly freed can't be decoded again, short of a fresh copy.
+    if let Some(j) = prior.as_mut()
+        && j.header.mode == Mode::FreeAsRead
+    {
+        for (i, (f, arc)) in jobs.iter().enumerate() {
+            if !f.exists() {
+                continue;
+            }
+            for (k, b) in arc.blocks.iter().enumerate().skip(j.blocks_done(i)) {
+                if extract::on_disk(&out, b)? {
+                    j.mark_done(i, k)?;
+                    continue;
+                }
+                if resume::freed(f, b.start, b.start + b.packed)? {
+                    let name = f.file_name().unwrap_or_default().display();
+                    bail!(
+                        "{name} was being freed as it was read when the extraction stopped, so part \
+                         of it is gone; the {k} block(s) of it extracted before that are kept. \
+                         Download {name} again, put it in place of this one, and run the same \
+                         command: it goes on from there. The other data files are fine."
+                    );
+                }
+                break;
+            }
+        }
     }
 
     fs::create_dir_all(&out).with_context(|| format!("creating {}", out.display()))?;
-    let out = std::path::absolute(&out)?;
     let host = match &a.host {
         Some(h) => h.clone(),
         None => std::env::current_exe()?.with_file_name("unrepack-clshost.exe"),
@@ -1029,6 +1176,21 @@ fn extract_cmd(a: Args) -> Result<()> {
         });
     }
 
+    // A command of Setup's that was cut off may have left anything behind,
+    // and nothing says running it twice is safe. The repack is kept on this
+    // path, so starting over only costs time.
+    if let (Some(j), Some(steps)) = (&prior, &steps)
+        && let Some(i) = j.interrupted_step()
+    {
+        let what = match steps.get(i) {
+            Some(recipe::Step::Run { exe, .. }) => exe.as_str(),
+            _ => "a command",
+        };
+        bail!(
+            "the extraction stopped while Setup's step {what} was running, which can't be known to \
+             be safe to run twice. Extract into an empty folder again; the repack is unchanged."
+        );
+    }
     // Everything refusable is refused here, before anything changes.
     let mut seen = std::collections::HashMap::new();
     for (f, arc) in &jobs {
@@ -1049,9 +1211,10 @@ fn extract_cmd(a: Args) -> Result<()> {
                         e.path.display()
                     );
                 }
+                // A rerun finds its own files; the first run checked.
                 let t = out.join(&e.path);
                 ensure!(
-                    e.is_dir || !t.exists(),
+                    e.is_dir || prior.is_some() || !t.exists(),
                     "{} already exists; extract into an empty folder",
                     t.display()
                 );
@@ -1073,38 +1236,78 @@ fn extract_cmd(a: Args) -> Result<()> {
         );
     }
     let out_volume = win::volume(&out)?;
-    let same_volume = jobs
-        .iter()
-        .all(|(f, _)| win::volume(f).ok() == Some(out_volume));
-    let mut consume = a.free_as_read;
-    if consume {
-        let all_sparse = jobs.iter().all(|(f, _)| {
+    let present = || jobs.iter().map(|(f, _)| f).filter(|f| f.exists());
+    let same_volume = present().all(|f| win::volume(f).ok() == Some(out_volume));
+    let mut mode = if a.free_per_block {
+        Mode::FreePerBlock
+    } else if a.free_as_read {
+        Mode::FreeAsRead
+    } else if a.delete_each {
+        Mode::DeleteEach
+    } else {
+        Mode::Keep
+    };
+    if mode.frees() {
+        let all_sparse = present().all(|f| {
             fs::File::open(f)
                 .map(|h| win::sparse_supported(&h))
                 .unwrap_or(false)
         });
         ensure!(
             all_sparse,
-            "the repack's drive can't free parts of a file (FAT32 or exFAT?); drop --free-as-read"
+            "the repack's drive can't free parts of a file (FAT32 or exFAT?); drop --free-as-read \
+             and --free-per-block"
         );
-        if !same_volume {
-            note!(
-                "note: the output is on another drive, so freeing the repack doesn't help it; not freeing."
-            );
-            consume = false;
-        }
     }
-    let delete_each = a.delete_each && same_volume;
+    if mode.removes() && !same_volume {
+        note!(
+            "note: the output is on another drive, so freeing or deleting the repack doesn't help it; keeping it."
+        );
+        mode = Mode::Keep;
+    }
     // ponytail: FitGirl's rebuild scripts get {src} patched in and may read
     // the repack; allow these once it's known they don't.
     ensure!(
-        steps.is_none() || !(consume || delete_each),
+        steps.is_none() || !mode.removes(),
         "this repack's Setup.exe runs commands after unpacking that may read the repack, so it \
-         has to be kept: drop --free-as-read and --delete-each"
+         has to be kept: drop --free-as-read, --free-per-block and --delete-each"
     );
-    let total_out: u64 = jobs.iter().map(|(_, a)| a.unpacked()).sum();
-    let total_in: u64 = jobs.iter().map(|(_, a)| a.len).sum();
-    let need = space_needed(&jobs, consume, delete_each);
+    if let Some(j) = &prior {
+        ensure!(
+            j.header.mode == mode,
+            "{} holds an extraction that stopped, started {}; run it again the same way, or \
+             extract into an empty folder",
+            out.display(),
+            match j.header.mode {
+                Mode::Keep => "keeping the repack",
+                Mode::DeleteEach => "with --delete-each",
+                Mode::FreeAsRead => "with --free-as-read",
+                Mode::FreePerBlock => "with --free-per-block",
+            }
+        );
+    }
+    // What is left to do: on a rerun, the blocks not yet on disk.
+    let rest: Vec<(PathBuf, freearc::Archive)> = jobs
+        .iter()
+        .enumerate()
+        .map(|(i, (f, a))| {
+            let skip = prior.as_ref().map_or(0, |j| j.blocks_done(i));
+            let blocks = a.blocks.get(skip..).unwrap_or_default().to_vec();
+            let len = blocks.first().map_or(0, |b| a.len - b.start);
+            (f.clone(), freearc::Archive { len, blocks })
+        })
+        .collect();
+    if let Some(j) = &prior {
+        let n: usize = jobs.iter().map(|(_, a)| a.blocks.len()).sum();
+        let done: usize = (0..jobs.len()).map(|i| j.blocks_done(i)).sum();
+        say!(
+            "continuing the extraction that stopped in {}: {done} of {n} block(s) are done",
+            out.display()
+        );
+    }
+    let total_out: u64 = rest.iter().map(|(_, a)| a.unpacked()).sum();
+    let total_in: u64 = rest.iter().map(|(_, a)| a.len).sum();
+    let need = space_needed(&rest, mode);
     let free = win::free_space(&out)?;
     say!(
         "{} data file(s), {} packed, {} to write; free {}, needed {}{}",
@@ -1113,17 +1316,16 @@ fn extract_cmd(a: Args) -> Result<()> {
         human(total_out),
         human(free),
         human(need),
-        if consume {
-            " (freeing the repack as it is read)"
-        } else if delete_each {
-            " (deleting each data file when done)"
-        } else {
-            ""
+        match mode {
+            Mode::FreeAsRead => " (freeing the repack as it is read)",
+            Mode::FreePerBlock => " (freeing each block of the repack once it is on disk)",
+            Mode::DeleteEach => " (deleting each data file when done)",
+            Mode::Keep => "",
         }
     );
-    if !consume && steps.is_none() {
-        let with_free = space_needed(&jobs, same_volume, false);
-        if with_free < need {
+    if mode == Mode::Keep && steps.is_none() && prior.is_none() {
+        let with_free = space_needed(&rest, Mode::FreeAsRead);
+        if same_volume && with_free < need {
             say!("with --free-as-read it would need {}", human(with_free));
         }
     }
@@ -1142,12 +1344,18 @@ fn extract_cmd(a: Args) -> Result<()> {
         human(need - free)
     );
 
-    if (consume || delete_each) && !a.yes {
-        let q = if consume {
-            "This frees the repack's bytes as they are read. If the run stops for any reason after \
-             it starts, the repack is lost and must be downloaded again."
-        } else {
-            "Each data file is deleted once all of it is extracted and checked."
+    if mode.removes() && !a.yes {
+        let q = match mode {
+            Mode::FreeAsRead => {
+                "This frees the repack's bytes as they are read. If the run stops partway through a \
+                 block (a crash or power cut), that data file's freed part is gone: running the same \
+                 command again finishes everything else and asks you to download that one file again."
+            }
+            Mode::FreePerBlock => {
+                "This frees each block of the repack once its files are on disk. If the run stops, \
+                 running the same command again goes on from there."
+            }
+            _ => "Each data file is deleted once all of it is extracted and checked.",
         };
         if !confirm(q)? {
             bail!("stopped; nothing was changed");
@@ -1157,7 +1365,7 @@ fn extract_cmd(a: Args) -> Result<()> {
 
     // Setup's steps up to its first unpack into the game folder, and every
     // tool archive: the verify pass and later steps need them. All of this
-    // touches only the decoders' folder.
+    // touches only the decoders' folder, so a rerun does it again.
     let mut first = 0;
     if let (Some(steps), Some(pl)) = (&steps, &places) {
         first = steps
@@ -1170,15 +1378,15 @@ fn extract_cmd(a: Args) -> Result<()> {
                 .filter(|s| matches!(s, recipe::Step::Extract { tools: true, .. })),
         );
         for s in early {
-            setup_step(s, pl, &tools, &[], &dec, &mut Progress::new(0))
+            setup_step(s, pl, &tools, &[], &dec, None, &mut Progress::new(0))
                 .inspect_err(|_| carved.iter().for_each(Carved::keep))?;
         }
     }
 
-    if a.verify {
+    if a.verify && total_out > 0 {
         let mut p = Progress::new(total_out);
         let temp = extract::FolderPeak::start(dec.work.clone());
-        for (f, arc) in &jobs {
+        for (f, arc) in rest.iter().filter(|(_, a)| !a.blocks.is_empty()) {
             note!("verifying {}", f.display());
             let r = extract::verify(
                 &Job {
@@ -1197,13 +1405,13 @@ fn extract_cmd(a: Args) -> Result<()> {
         note!("every file's CRC matches");
         // The plan above was an estimate; the verify pass measured the two
         // things it couldn't know, so check again before anything changes.
-        let files: u64 = jobs
+        let files: u64 = rest
             .iter()
             .flat_map(|(_, a)| &a.blocks)
             .flat_map(|b| &b.entries)
             .filter(|e| !e.is_dir)
             .count() as u64;
-        let base = if consume {
+        let base = if mode == Mode::FreeAsRead {
             p.max_lead + files * 4096 + 2 * extract::PUNCH_STEP
         } else {
             need
@@ -1224,22 +1432,58 @@ fn extract_cmd(a: Args) -> Result<()> {
         );
         note!("extracting");
     }
+    // Only now, with nothing changed before, is there anything to continue.
+    let mut journal = match prior {
+        Some(j) => j,
+        None => resume::create(
+            &out,
+            resume::Header {
+                mode,
+                data: jobs
+                    .iter()
+                    .map(|(f, a)| -> Result<_> {
+                        Ok(resume::DataFile {
+                            path: f.clone(),
+                            len: fs::metadata(f)?.len(),
+                            blocks: a.blocks.len(),
+                        })
+                    })
+                    .collect::<Result<_>>()?,
+            },
+        )?,
+    };
     let mut p = Progress::new(total_out);
     if let (Some(steps), Some(pl)) = (&steps, &places) {
         // What Setup installs into the game folder itself: FitGirl's hash
-        // lists, one per component, which its last step joins up.
-        if let Some(setup) = setup_in(&src_dir) {
+        // lists, one per component, which its last step joins up. Once a
+        // step is done, a later one may have moved or deleted them.
+        if let Some(setup) = setup_in(&src_dir)
+            && journal.steps_done() == 0
+        {
             let n = inno::carve_app(&setup, Some(&out), &|c| chosen_component(steps, &jobs, c))?;
             say!(
                 "copied {} file(s) Setup.exe puts in the game folder itself",
                 n.len()
             );
         }
-        for s in &steps[first..] {
-            if !matches!(s, recipe::Step::Extract { tools: true, .. }) {
-                setup_step(s, pl, &tools, &jobs, &dec, &mut p)
-                    .inspect_err(|_| carved.iter().for_each(Carved::keep))?;
+        // An unpack the stopped run was in goes on from its last block on
+        // disk; a command it was running was refused above.
+        for (i, s) in steps.iter().enumerate().skip(first) {
+            if matches!(s, recipe::Step::Extract { tools: true, .. }) || i < journal.steps_done() {
+                continue;
             }
+            if matches!(s, recipe::Step::Run { .. }) {
+                journal.begin_step(i)?;
+            }
+            setup_step(s, pl, &tools, &jobs, &dec, Some(&mut journal), &mut p)
+                .inspect_err(|_| carved.iter().for_each(Carved::keep))?;
+            if let recipe::Step::Run { makes, .. } = s
+                && let Some(f) = recipe::product(makes)
+                && pl.app.join(f).is_file()
+            {
+                extract::flush(&[pl.app.join(f)])?;
+            }
+            journal.step_done(i)?;
         }
         // A rebuild step that exits 0 without making its file would leave
         // the game folder short; Setup names the file it makes.
@@ -1256,6 +1500,7 @@ fn extract_cmd(a: Args) -> Result<()> {
                 );
             }
         }
+        journal.finish()?;
         let _ = fs::remove_dir(&dec.work);
         say!(
             "done: {} in {}, and Setup's steps after it",
@@ -1264,23 +1509,30 @@ fn extract_cmd(a: Args) -> Result<()> {
         );
         return Ok(());
     }
-    for (f, arc) in &jobs {
-        note!("extracting {}", f.display());
-        extract::run(
-            &Job {
-                data: f,
-                archive: arc,
-            },
-            &dec,
-            &out,
-            consume,
-            &mut p,
-        )?;
-        if delete_each && !consume {
-            extract::flush(&out, arc)?;
+    journal.lazy_end = mode == Mode::Keep;
+    for (i, (f, arc)) in jobs.iter().enumerate() {
+        if !journal.complete(i) {
+            note!("extracting {}", f.display());
+            extract::run(
+                &Job {
+                    data: f,
+                    archive: arc,
+                },
+                &dec,
+                &out,
+                mode,
+                Some((&mut journal, i)),
+                &mut p,
+            )?;
+        }
+        // Gone once all of it is on disk, which the journal now says; a
+        // rerun finishes this if the last one stopped in between.
+        if mode.removes() && f.exists() {
             fs::remove_file(f).with_context(|| format!("deleting {}", f.display()))?;
+            let _ = fs::remove_file(extract::marker(f));
         }
     }
+    journal.finish()?;
     let _ = fs::remove_dir(&dec.work);
     say!("done: {} in {}", human(total_out), out.display());
     Ok(())
@@ -1510,13 +1762,15 @@ mod tests {
             ("2".into(), arc(307_063_704, 496_164_864)),
         ];
         // Nothing freed: all output on top of the repack.
-        assert_eq!(space_needed(&jobs, false, false), 19_867_738_112);
+        assert_eq!(space_needed(&jobs, Mode::Keep), 19_867_738_112);
         // Whole files deleted when done: the peak is data1's own output, before
         // anything can go; little help with one big data file.
-        assert_eq!(space_needed(&jobs, false, true), 19_371_573_248);
+        assert_eq!(space_needed(&jobs, Mode::DeleteEach), 19_371_573_248);
+        // Freed per block: each data file is one block, so the same.
+        assert_eq!(space_needed(&jobs, Mode::FreePerBlock), 19_371_573_248);
         // Freed as read: output minus the whole repack.
         assert_eq!(
-            space_needed(&jobs, true, false),
+            space_needed(&jobs, Mode::FreeAsRead),
             19_867_738_112 - 6_047_141_269
         );
     }

@@ -105,9 +105,10 @@ The repack's own decoders are needed too: `cls-*.dll` plug-ins, their `cls-*_x64
 | `--work <dir>` | Where decoders run and keep their temp files. Default: `<output>\.unrepack-work` |
 | `--log <file>` | Also write every message, and a progress line every 5 s, to a file |
 | `--check` | Plan only: say whether it fits, change nothing |
-| `--delete-each` | Delete each data file once all of it is extracted. Crash safe |
-| `--free-as-read` | Free each data file's bytes as they are decoded. **Not crash safe** (see [Safety](#is-unrepack-safe)) |
-| `--verify` | Decode everything once, checking every CRC, before writing anything. On by default with `--free-as-read` and `--delete-each`; doubles the time |
+| `--delete-each` | Delete each data file once all of it is extracted |
+| `--free-as-read` | Free each data file's bytes as they are decoded. A crash partway through a block loses that data file's freed part (see [When a run stops](#when-a-run-stops)) |
+| `--free-per-block` | Free a block's bytes only once its files are on disk. A crash loses nothing, but a data file that is one block frees nothing until it is done |
+| `--verify` | Decode everything once, checking every CRC, before writing anything. On by default when freeing or deleting; doubles the time |
 | `--no-verify` | Skip that pass even when freeing or deleting. Removes the safety net |
 | `-y, --yes` | Don't ask before freeing or deleting |
 
@@ -115,13 +116,33 @@ The repack's own decoders are needed too: `cls-*.dll` plug-ins, their `cls-*_x64
 
 Measured by `--check` on Crusader Kings III [DODI Repack] (6.05 GB packed, 19.87 GB of game):
 
-| Mode | Needs free | Crash safe |
+| Mode | Needs free | After a crash |
 |---|---|---|
-| Default | 19.99 GB | Yes, the repack is kept |
-| `--delete-each` | 19.49 GB | Yes, each data file is deleted only once it is fully extracted |
-| `--free-as-read` | 13.94 GB | **No.** A crash or a decoder failure after the first freed byte loses the repack |
+| Default | 19.99 GB | Continues; the repack is kept |
+| `--delete-each` | 19.49 GB | Continues; each data file is deleted only once it is fully extracted |
+| `--free-per-block` | 19.49 GB | Continues; nothing is freed before it is on disk. Each of this repack's data files is one block, so it needs what `--delete-each` does |
+| `--free-as-read` | 13.94 GB | Continues, unless it stopped inside a block: then that data file has to be downloaded again |
 
 The `--check` figures come before any decoding. They assume the freed input keeps pace with the output, and they leave out the decoders' temp files. The verify pass measures both and checks the space again before anything is freed.
+
+### When a run stops
+
+A crash, a power cut, a closed window or a failing decoder doesn't throw the work away. Run the same command again (in the app, press Unpack with the same repack, folder and choices) and it goes on from where it stopped:
+
+```powershell
+unrepack extract "Game [DODI Repack]" -o "D:\Games\Game" --delete-each   # stopped partway
+unrepack extract "Game [DODI Repack]" -o "D:\Games\Game" --delete-each   # continues
+```
+
+The output folder keeps a small journal, `.unrepack-resume`, of what is on disk; it goes when the extraction is done. A run with other data files or another mode into that folder is refused.
+
+It continues block by block. A FreeArc data file is one or a few solid blocks, and the repack's decoders can't start partway into one, so the block that was being decoded is decoded again from its start. Most DODI data files are a single block, so their progress restarts from the beginning of that data file; data files already done are skipped. ZIP entries are one block each.
+
+With `--free-as-read`, the block being read when the run stopped may already be partly freed, and then nothing can decode it. The rerun says which data file that is. Download it again, put it in place of the old one, and run the same command: the blocks of it already extracted are skipped, and the other data files were never touched. If losing that file isn't acceptable, use `--free-per-block`: it frees a block only once its files are on disk, at the cost of more space while a block is decoded.
+
+When Setup.exe has install steps (see [Setup's install steps](#setups-install-steps)), a run that stopped during an unpack goes on from its last block, and finished steps are skipped. One that stopped while one of Setup's commands was running is refused, since a command cut off halfway can't be known to be safe to run again: extract into an empty folder again; the repack is kept in that case anyway. Resuming through Setup's steps hasn't been tried on a real repack yet.
+
+The journal only counts a block as done once its files are forced to disk, so even a power cut can't make a rerun skip a file that never got there. Unpacking is checkpointed every 1 GiB or 60 s; after a crash, at most that much is unpacked again.
 
 ### Zipped games
 
@@ -161,7 +182,7 @@ Freeing the repack while reading it gave the same files as keeping it. Against F
 | ZIP archives, stored and deflate, ZIP64 | Works |
 | Encrypted or split ZIPs, other ZIP methods, 7z, RAR | Refused before anything changes |
 | Other built-ins (`ppmd`, `rep`, `exe`, `lzma2`, …), `4x4` around a CLS plug-in | Refused before anything changes |
-| Resume after a crash | Not yet |
+| Resume after a crash | Works, block by block; a block being freed as it was read needs its data file again |
 | Setup's install steps: tool archives, data file order, rebuild commands, `.ini` edits, deletes | Works, for Inno Setup 5.5 installers |
 | Registry entries, redistributables, steps behind a wizard checkbox | Not done |
 
@@ -172,7 +193,8 @@ Freeing the repack while reading it gave the same files as keeping it. Against F
 
 - **Nothing is freed until the whole repack decodes.** Before `--free-as-read` or `--delete-each` changes anything, a verify pass decodes every data file and checks every file's CRC. That pass also measures the decoders' temp files and how far the output runs ahead of the input, and checks the free space again with those numbers. `--no-verify` skips it.
 - **A full disk pauses the run instead of ending it.**
-- **A half-freed data file is never used again.** A marker file, `<data file>.unrepack-consumed`, makes any later run refuse it.
+- **A stopped run continues.** See [When a run stops](#when-a-run-stops).
+- **A half-freed data file is only used by the run that freed it.** A marker file, `<data file>.unrepack-consumed`, makes any other run refuse it; running the same extraction again continues it.
 - **Damaged downloads are caught first.** When the repack has an MD5 list (FitGirl's `MD5\*.md5`), every data file is checked against it before anything runs. A damaged language or extra is left out, and a damaged game file stops the run. Some decoders loop forever on damaged data instead of failing: FitGirl's `rzw` did on CONTROL's Spanish voices.
 - **A failing decoder stops the whole chain.** A decoder's error dialog is written to the log instead of waiting for a click. Every decoder process goes into one job object, so if one stage fails, every stage stops.
 - **Decoders that need admin are named up front.** FitGirl's `srep` and `magic2` share memory under `Global\` names, which only an elevated process may create. unrepack says to run as administrator before it starts, instead of failing partway.
@@ -180,7 +202,7 @@ Freeing the repack while reading it gave the same files as keeping it. Against F
 - **Built-in decoders don't trust the stream.** Where FreeArc's C code trusts sizes read from the data, the ports refuse bad ones.
 - **Decoders stay in their folder.** An `arc.ini` entry that names a program outside the decoders folder is refused.
 
-What it can't protect against yet: with `--free-as-read`, a crash, a power cut, or a decoder failure after the first byte is freed loses the repack. That includes a decoder's own temp file hitting a full disk, which the measured check above is the only guard against. Use `--delete-each`, or keep the repack, when it can't be downloaded again.
+What it can't protect against: with `--free-as-read`, a crash, a power cut, or a decoder failure inside a block whose bytes are already partly freed loses that data file, which then has to be downloaded again. That includes a decoder's own temp file hitting a full disk, which the measured check above is the only guard against. Use `--free-per-block` or `--delete-each`, or keep the repack, when it can't be downloaded again.
 
 ## How it works
 
@@ -190,7 +212,7 @@ A FreeArc data file is a series of solid blocks, each packed by a chain of metho
 - **External decoders** from `arc.ini` run as processes in the work folder.
 - **`4x4`**, **`delta`**, **`dispack070`**, **`tor`** and **`lzma`** run as threads inside unrepack. `delta`, `dispack070` and `tor` are Rust ports of FreeArc 0.67's decoders, and the tables of the first two match the repack's own `unarc.dll` byte for byte. `lzma` is FreeArc's raw LZMA stream, with its settings taken from the method string.
 
-The last stage's output is cut into files, and each file's CRC is checked. With `--free-as-read`, unrepack zeroes the parts of the data file it has read as a sparse range (`FSCTL_SET_ZERO_DATA`), so NTFS gives that space back while the file keeps its size and offsets. Once a data file is fully read, it is deleted.
+The last stage's output is cut into files, and each file's CRC is checked. With `--free-as-read`, unrepack zeroes the parts of the data file it has read as a sparse range (`FSCTL_SET_ZERO_DATA`), so NTFS gives that space back while the file keeps its size and offsets. With `--free-per-block`, it zeroes a block's range only after the journal records the block as on disk. Once a data file is fully read, it is deleted.
 
 ## Build and test
 
